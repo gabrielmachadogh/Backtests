@@ -13,7 +13,9 @@ jobs:
     env:
       SYMBOL: BTC_USDT
       TIMEFRAMES: 1h,2h,4h,1d,1w
-      SETUPS: PFR,DL,IB
+
+      # só PFR e DL
+      SETUPS: PFR,DL
 
       SMA_SHORT: "8"
       SMA_LONG: "80"
@@ -23,8 +25,8 @@ jobs:
       RRS: "1,1.5,2"
       AMBIGUOUS_POLICY: loss
 
-      # para gerar fill_delay 1..4:
-      MAX_ENTRY_WAIT_BARS: "4"
+      # solicitado: só entra se romper no próximo candle
+      MAX_ENTRY_WAIT_BARS: "1"
       MAX_HOLD_BARS: "50"
 
       MAX_BARS_1H: "20000"
@@ -61,10 +63,6 @@ jobs:
             "results/backtest_trades_${SYMBOL}.csv" \
             "results/backtest_summary_${SYMBOL}.md" \
             "results/backtest_summary_${SYMBOL}.csv" \
-            "results/backtest_report_slope_${SYMBOL}.md" \
-            "results/backtest_report_slope_${SYMBOL}.csv" \
-            "results/backtest_report_fill_delay_${SYMBOL}.md" \
-            "results/backtest_report_fill_delay_${SYMBOL}.csv" \
             || true
 
           git commit -m "update backtest outputs ${SYMBOL}" || echo "no changes to commit"
