@@ -1,0 +1,43 @@
+name: backtest-mexc
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run backtest
+        run: python backtest.py
+        env:
+          SYMBOL: BTC_USDT
+          TIMEFRAMES: 1h,2h,4h,1d,1w
+          SHORT_MA: "10"
+          LONG_MA: "100"
+          MA_TYPE: sma
+          ATR_PERIOD: "14"
+          ATR_MULT: "1.0"
+          MAX_HOLD_BARS: "50"
+          RRS: "1,1.5,2,3"
+          AMBIGUOUS_POLICY: loss
+          DEBUG: "0"
+
+      - name: Upload results (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-${{ github.run_id }}
+          overwrite: true
+          path: results/**
