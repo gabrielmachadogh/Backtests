@@ -38,6 +38,34 @@ TICK_SIZE = float(os.getenv("TICK_SIZE", "0"))
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
 
+def fmt_pct(win_rate) -> str:
+    """
+    Formata taxa de acerto como:
+      - 43,2%
+      - 9,8%
+      - 100%
+    (no máximo 3 dígitos antes do %)
+    """
+    try:
+        if win_rate is None:
+            return "-"
+        if isinstance(win_rate, (float, np.floating)) and np.isnan(win_rate):
+            return "-"
+        pct = float(win_rate) * 100.0
+    except Exception:
+        return "-"
+
+    if pct >= 100:
+        return "100%"
+
+    # 1 casa decimal e vírgula decimal
+    s = f"{pct:.1f}".replace(".", ",")
+    # remove ",0"
+    if s.endswith(",0"):
+        s = s[:-2]
+    return f"{s}%"
+
+
 # -------------------- infra / parsing --------------------
 def http_get_json(url, params=None, tries=3, timeout=25):
     last = None
@@ -168,7 +196,6 @@ def sma(series: pd.Series, period: int) -> pd.Series:
 
 
 def infer_tick_size_from_prices(close_series: pd.Series) -> float:
-    # usa casas decimais do último close (bom o suficiente p/ backtest de candle)
     last = float(close_series.dropna().iloc[-1])
     s = f"{last:.10f}".rstrip("0").rstrip(".")
     if "." in s:
@@ -189,12 +216,10 @@ def add_trend_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def pfr_buy_signal(x: pd.DataFrame, i: int) -> bool:
-    # low[i] menor que low dos dois anteriores; close[i] > close[i-1]
     return (x.loc[i, "low"] < x.loc[i - 1, "low"]) and (x.loc[i, "low"] < x.loc[i - 2, "low"]) and (x.loc[i, "close"] > x.loc[i - 1, "close"])
 
 
 def pfr_sell_signal(x: pd.DataFrame, i: int) -> bool:
-    # high[i] maior que high dos dois anteriores; close[i] < close[i-1]
     return (x.loc[i, "high"] > x.loc[i - 1, "high"]) and (x.loc[i, "high"] > x.loc[i - 2, "high"]) and (x.loc[i, "close"] < x.loc[i - 1, "close"])
 
 
@@ -272,7 +297,6 @@ def simulate_tp_sl(x: pd.DataFrame, entry_idx: int, side: str, entry_price: floa
 def backtest_pfr(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
     x = add_trend_columns(df).reset_index(drop=True)
 
-    # tick size
     tick = TICK_SIZE if TICK_SIZE > 0 else infer_tick_size_from_prices(x["close"])
 
     if DEBUG:
@@ -280,9 +304,8 @@ def backtest_pfr(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
 
     rows = []
 
-    # i precisa de i-2 e SMA100 já calculado
     start = max(SMA_LONG + 2, 2)
-    for i in range(start, len(x) - 1):  # precisa ter candle futuro p/ tentar fill
+    for i in range(start, len(x) - 1):
         if pd.isna(x.loc[i, "sma10"]) or pd.isna(x.loc[i, "sma100"]):
             continue
 
@@ -293,7 +316,6 @@ def backtest_pfr(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
 
             fill_idx = find_fill_long(x, entry_price, i + 1, MAX_ENTRY_WAIT_BARS)
             if fill_idx is None:
-                # sinal não virou trade
                 continue
 
             row = {
@@ -334,7 +356,7 @@ def backtest_pfr(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
 
 def summarize(results: pd.DataFrame) -> pd.DataFrame:
     if results.empty:
-        return pd.DataFrame(columns=["timeframe", "rr", "trades", "wins", "losses", "no_hit", "skipped", "win_rate"])
+        return pd.DataFrame(columns=["timeframe", "rr", "trades", "wins", "losses", "no_hit", "skipped", "win_rate", "win_rate_pct"])
 
     summaries = []
     for tf in sorted(results["timeframe"].unique()):
@@ -347,7 +369,7 @@ def summarize(results: pd.DataFrame) -> pd.DataFrame:
             skipped = int((rtf[col] == "skip").sum())
             trades = wins + losses + no_hit + skipped
 
-            denom = wins + losses  # taxa de acerto só dos resolvidos
+            denom = wins + losses
             win_rate = (wins / denom) if denom > 0 else np.nan
 
             summaries.append({
@@ -359,6 +381,7 @@ def summarize(results: pd.DataFrame) -> pd.DataFrame:
                 "no_hit": no_hit,
                 "skipped": skipped,
                 "win_rate": win_rate,
+                "win_rate_pct": fmt_pct(win_rate),
             })
     return pd.DataFrame(summaries)
 
@@ -376,13 +399,11 @@ def save_markdown(summary_df: pd.DataFrame, path: str):
             f.write("Sem resultados.\n")
             return
 
-        f.write("| TF | RR | Trades | Wins | Losses | NoHit | Skipped | WinRate (wins/(wins+losses)) |\n")
+        f.write("| TF | RR | Trades | Wins | Losses | NoHit | Skipped | WinRate |\n")
         f.write("|---|---:|---:|---:|---:|---:|---:|---:|\n")
         for _, r in summary_df.iterrows():
-            wr = r["win_rate"]
-            wr_str = f"{wr:.3f}" if isinstance(wr, (float, np.floating)) and not np.isnan(wr) else "-"
             f.write(
-                f"| {r['timeframe']} | {r['rr']} | {int(r['trades'])} | {int(r['wins'])} | {int(r['losses'])} | {int(r['no_hit'])} | {int(r['skipped'])} | {wr_str} |\n"
+                f"| {r['timeframe']} | {r['rr']} | {int(r['trades'])} | {int(r['wins'])} | {int(r['losses'])} | {int(r['no_hit'])} | {int(r['skipped'])} | {r.get('win_rate_pct','-')} |\n"
             )
 
 
@@ -395,12 +416,10 @@ def main():
     print(f"[info] MAX_ENTRY_WAIT_BARS={MAX_ENTRY_WAIT_BARS} MAX_HOLD_BARS={MAX_HOLD_BARS} AMBIGUOUS_POLICY={AMBIGUOUS_POLICY}")
     print(f"[info] MAX_BARS_1H={MAX_BARS_1H} WINDOW_DAYS={WINDOW_DAYS} TICK_SIZE={TICK_SIZE}")
 
-    # 1) baixa 1h máximo
     df_1h = fetch_ohlcv_1h_max(SYMBOL, max_bars=MAX_BARS_1H, window_days=WINDOW_DAYS)
     if df_1h.empty:
         raise RuntimeError("Não consegui baixar candles 1h.")
 
-    # 2) monta dataframes por TF (a partir do 1h)
     tf_map = {"1h": df_1h}
 
     if "2h" in TIMEFRAMES:
@@ -410,10 +429,8 @@ def main():
     if "1d" in TIMEFRAMES:
         tf_map["1d"] = resample_ohlcv(df_1h, "1D")
     if "1w" in TIMEFRAMES:
-        # semana fechando domingo (UTC)
         tf_map["1w"] = resample_ohlcv(df_1h, "W-SUN")
 
-    # 3) backtest por TF
     all_results = []
     for tf in ["1h", "2h", "4h", "1d", "1w"]:
         if tf not in TIMEFRAMES:
