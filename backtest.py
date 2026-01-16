@@ -11,25 +11,34 @@ SYMBOL = os.getenv("SYMBOL", "BTC_USDT")
 # Timeframes desejados
 TIMEFRAMES = [x.strip().lower() for x in os.getenv("TIMEFRAMES", "1h,2h,4h,1d,1w").split(",") if x.strip()]
 
-# Setup/indicadores
-SHORT_MA = int(os.getenv("SHORT_MA", "10"))
-LONG_MA = int(os.getenv("LONG_MA", "100"))
-MA_TYPE = os.getenv("MA_TYPE", "sma").lower()  # sma|ema
-
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-ATR_MULT = float(os.getenv("ATR_MULT", "1.0"))  # define distância do stop
-MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "50"))  # se não bater TP nem SL até aqui => "no_hit"
+# Trend filter (SMA 10/100 fixo conforme sua regra)
+SMA_SHORT = int(os.getenv("SMA_SHORT", "10"))
+SMA_LONG = int(os.getenv("SMA_LONG", "100"))
 
 # RRs para simular
 RRS = [float(x) for x in os.getenv("RRS", "1,1.5,2,3").split(",")]
 
 # Se no mesmo candle bater TP e SL, qual regra usar?
-# "loss" (conservador), "win" (otimista), "skip" (ignora o trade)
+# "loss" (conservador), "win" (otimista), "skip" (ignora esse trade nesse RR)
 AMBIGUOUS_POLICY = os.getenv("AMBIGUOUS_POLICY", "loss").lower()
+
+# Máximo tempo para a ordem "pegar" após o candle do sinal
+MAX_ENTRY_WAIT_BARS = int(os.getenv("MAX_ENTRY_WAIT_BARS", "10"))
+
+# Máximo tempo para bater TP/SL depois de entrar
+MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "50"))
+
+# Quanto histórico 1h tentar puxar (quanto maior, mais lento/mais chamadas)
+MAX_BARS_1H = int(os.getenv("MAX_BARS_1H", "20000"))  # ~833 dias
+WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", "30"))
+
+# Tick size (se 0, ele infere pelo número de casas do preço)
+TICK_SIZE = float(os.getenv("TICK_SIZE", "0"))
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
 
+# -------------------- infra / parsing --------------------
 def http_get_json(url, params=None, tries=3, timeout=25):
     last = None
     for i in range(tries):
@@ -41,14 +50,6 @@ def http_get_json(url, params=None, tries=3, timeout=25):
             last = e
             time.sleep(1.5 * (i + 1))
     raise last
-
-
-def calc_ma(series: pd.Series, period: int, ma_type: str) -> pd.Series:
-    if ma_type == "sma":
-        return series.rolling(period).mean()
-    if ma_type == "ema":
-        return series.ewm(span=period, adjust=False).mean()
-    raise ValueError("MA_TYPE deve ser 'sma' ou 'ema'")
 
 
 def to_datetime_auto(ts_series: pd.Series) -> pd.Series:
@@ -103,13 +104,13 @@ def parse_kline_to_df(payload):
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df = df.dropna(subset=["ts", "open", "high", "low", "close"]).sort_values("ts")
+    df = df.dropna(subset=["ts", "open", "high", "low", "close"]).sort_values("ts").reset_index(drop=True)
     return df
 
 
-def fetch_ohlcv_1h_max(symbol: str, max_bars: int = 20000, window_days: int = 30):
+def fetch_ohlcv_1h_max(symbol: str, max_bars: int, window_days: int):
     """
-    Baixa o máximo que der de 1h, paginando por janelas de tempo.
+    Baixa o máximo que der de 1h, paginando por janelas.
     """
     interval = "Min60"
     now_s = int(time.time())
@@ -144,18 +145,14 @@ def fetch_ohlcv_1h_max(symbol: str, max_bars: int = 20000, window_days: int = 30
     if not dfs:
         return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
 
-    out = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["ts"]).sort_values("ts")
+    out = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
     if len(out) > max_bars:
-        out = out.tail(max_bars)
+        out = out.tail(max_bars).reset_index(drop=True)
     return out
 
 
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """
-    rule exemplos: '2H', '4H', '1D', 'W-SUN'
-    """
-    x = df.copy()
-    x = x.set_index("ts")
+    x = df.copy().set_index("ts")
     y = x.resample(rule).agg(
         open=("open", "first"),
         high=("high", "max"),
@@ -166,76 +163,76 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return y
 
 
-def add_atr(df: pd.DataFrame, period: int) -> pd.DataFrame:
+def sma(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period).mean()
+
+
+def infer_tick_size_from_prices(close_series: pd.Series) -> float:
+    # usa casas decimais do último close (bom o suficiente p/ backtest de candle)
+    last = float(close_series.dropna().iloc[-1])
+    s = f"{last:.10f}".rstrip("0").rstrip(".")
+    if "." in s:
+        dec = len(s.split(".")[1])
+        return 10 ** (-dec)
+    return 1.0
+
+
+# -------------------- regra de tendência + PFR --------------------
+def add_trend_columns(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
-    prev_close = x["close"].shift(1)
-    tr = pd.concat([
-        (x["high"] - x["low"]).abs(),
-        (x["high"] - prev_close).abs(),
-        (x["low"] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    x["atr"] = tr.rolling(period).mean()
+    x["sma10"] = sma(x["close"], SMA_SHORT)
+    x["sma100"] = sma(x["close"], SMA_LONG)
+
+    x["trend_up"] = (x["close"] > x["sma10"]) & (x["close"] > x["sma100"]) & (x["sma10"] > x["sma100"])
+    x["trend_down"] = (x["close"] < x["sma10"]) & (x["close"] < x["sma100"]) & (x["sma10"] < x["sma100"])
     return x
 
 
-# ========= SETUP (VOCÊ VAI TROCAR AQUI DEPOIS) =========
-def generate_entries_default(df: pd.DataFrame):
+def pfr_buy_signal(x: pd.DataFrame, i: int) -> bool:
+    # low[i] menor que low dos dois anteriores; close[i] > close[i-1]
+    return (x.loc[i, "low"] < x.loc[i - 1, "low"]) and (x.loc[i, "low"] < x.loc[i - 2, "low"]) and (x.loc[i, "close"] > x.loc[i - 1, "close"])
+
+
+def pfr_sell_signal(x: pd.DataFrame, i: int) -> bool:
+    # high[i] maior que high dos dois anteriores; close[i] < close[i-1]
+    return (x.loc[i, "high"] > x.loc[i - 1, "high"]) and (x.loc[i, "high"] > x.loc[i - 2, "high"]) and (x.loc[i, "close"] < x.loc[i - 1, "close"])
+
+
+def find_fill_long(x: pd.DataFrame, entry_price: float, start_idx: int, max_wait: int):
+    end = min(start_idx + max_wait, len(x))
+    for j in range(start_idx, end):
+        if float(x.loc[j, "high"]) >= entry_price:
+            return j
+    return None
+
+
+def find_fill_short(x: pd.DataFrame, entry_price: float, start_idx: int, max_wait: int):
+    end = min(start_idx + max_wait, len(x))
+    for j in range(start_idx, end):
+        if float(x.loc[j, "low"]) <= entry_price:
+            return j
+    return None
+
+
+def simulate_tp_sl(x: pd.DataFrame, entry_idx: int, side: str, entry_price: float, stop_price: float, rr: float):
     """
-    Setup padrão: filtro de tendência MA + preço acima/abaixo
-    Long quando: ma_curta>ma_longa e close>ambas
-    Short quando: ma_curta<ma_longa e close<ambas
-    Entrada: OPEN do próximo candle quando o sinal "vira" True
-    Stop: ATR_MULT * ATR (atr do candle do sinal)
+    Retorna: win | loss | no_hit | skip
     """
-    x = df.copy()
-    x["ma_s"] = calc_ma(x["close"], SHORT_MA, MA_TYPE)
-    x["ma_l"] = calc_ma(x["close"], LONG_MA, MA_TYPE)
-
-    long_cond = (x["ma_s"] > x["ma_l"]) & (x["close"] > x["ma_s"]) & (x["close"] > x["ma_l"])
-    short_cond = (x["ma_s"] < x["ma_l"]) & (x["close"] < x["ma_s"]) & (x["close"] < x["ma_l"])
-
-    long_entry = long_cond & (~long_cond.shift(1).fillna(False))
-    short_entry = short_cond & (~short_cond.shift(1).fillna(False))
-
-    entries = []
-    for i in range(len(x) - 1):  # precisa ter próximo candle
-        if pd.isna(x.loc[i, "atr"]):
-            continue
-
-        risk = float(x.loc[i, "atr"]) * ATR_MULT
-        if risk <= 0:
-            continue
-
-        if bool(long_entry.iloc[i]):
-            entry_idx = i + 1
-            entry_price = float(x.loc[entry_idx, "open"])
-            stop_price = entry_price - risk
-            entries.append((entry_idx, "long", entry_price, stop_price))
-
-        if bool(short_entry.iloc[i]):
-            entry_idx = i + 1
-            entry_price = float(x.loc[entry_idx, "open"])
-            stop_price = entry_price + risk
-            entries.append((entry_idx, "short", entry_price, stop_price))
-
-    return entries
-# ======================================================
-
-
-def simulate_trade(df: pd.DataFrame, entry_idx: int, side: str, entry_price: float, stop_price: float, rr: float):
-    """
-    Retorna: "win" | "loss" | "no_hit" | "skip"
-    """
-    end_j = min(entry_idx + MAX_HOLD_BARS, len(df))
+    end_j = min(entry_idx + MAX_HOLD_BARS, len(x))
 
     if side == "long":
-        tp = entry_price + rr * (entry_price - stop_price)
+        risk = entry_price - stop_price
+        if risk <= 0:
+            return "skip"
+        tp = entry_price + rr * risk
         sl = stop_price
+
         for j in range(entry_idx, end_j):
-            h = float(df.loc[j, "high"])
-            l = float(df.loc[j, "low"])
+            h = float(x.loc[j, "high"])
+            l = float(x.loc[j, "low"])
             hit_tp = h >= tp
             hit_sl = l <= sl
+
             if hit_tp and hit_sl:
                 if AMBIGUOUS_POLICY == "skip":
                     return "skip"
@@ -247,13 +244,18 @@ def simulate_trade(df: pd.DataFrame, entry_idx: int, side: str, entry_price: flo
         return "no_hit"
 
     if side == "short":
-        tp = entry_price - rr * (stop_price - entry_price)
+        risk = stop_price - entry_price
+        if risk <= 0:
+            return "skip"
+        tp = entry_price - rr * risk
         sl = stop_price
+
         for j in range(entry_idx, end_j):
-            h = float(df.loc[j, "high"])
-            l = float(df.loc[j, "low"])
+            h = float(x.loc[j, "high"])
+            l = float(x.loc[j, "low"])
             hit_tp = l <= tp
             hit_sl = h >= sl
+
             if hit_tp and hit_sl:
                 if AMBIGUOUS_POLICY == "skip":
                     return "skip"
@@ -267,25 +269,65 @@ def simulate_trade(df: pd.DataFrame, entry_idx: int, side: str, entry_price: flo
     return "skip"
 
 
-def backtest_for_df(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
-    x = add_atr(df, ATR_PERIOD).reset_index(drop=True)
+def backtest_pfr(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
+    x = add_trend_columns(df).reset_index(drop=True)
 
-    entries = generate_entries_default(x)  # <- você vai trocar pelos seus setups
+    # tick size
+    tick = TICK_SIZE if TICK_SIZE > 0 else infer_tick_size_from_prices(x["close"])
+
     if DEBUG:
-        print(f"[debug] {tf_name}: entries={len(entries)} bars={len(x)}")
+        print(f"[debug] {tf_name}: bars={len(x)} tick={tick}")
 
     rows = []
-    for entry_idx, side, entry_price, stop_price in entries:
-        row = {
-            "timeframe": tf_name,
-            "entry_time": x.loc[entry_idx, "ts"],
-            "side": side,
-            "entry_price": entry_price,
-            "stop_price": stop_price,
-        }
-        for rr in RRS:
-            row[f"rr_{rr}"] = simulate_trade(x, entry_idx, side, entry_price, stop_price, rr)
-        rows.append(row)
+
+    # i precisa de i-2 e SMA100 já calculado
+    start = max(SMA_LONG + 2, 2)
+    for i in range(start, len(x) - 1):  # precisa ter candle futuro p/ tentar fill
+        if pd.isna(x.loc[i, "sma10"]) or pd.isna(x.loc[i, "sma100"]):
+            continue
+
+        # Compra só em tendência de alta
+        if bool(x.loc[i, "trend_up"]) and pfr_buy_signal(x, i):
+            entry_price = float(x.loc[i, "high"]) + tick
+            stop_price = float(x.loc[i, "low"]) - tick
+
+            fill_idx = find_fill_long(x, entry_price, i + 1, MAX_ENTRY_WAIT_BARS)
+            if fill_idx is None:
+                # sinal não virou trade
+                continue
+
+            row = {
+                "timeframe": tf_name,
+                "signal_time": x.loc[i, "ts"],
+                "entry_time": x.loc[fill_idx, "ts"],
+                "side": "long",
+                "entry_price": entry_price,
+                "stop_price": stop_price,
+            }
+            for rr in RRS:
+                row[f"rr_{rr}"] = simulate_tp_sl(x, fill_idx, "long", entry_price, stop_price, rr)
+            rows.append(row)
+
+        # Venda só em tendência de baixa
+        if bool(x.loc[i, "trend_down"]) and pfr_sell_signal(x, i):
+            entry_price = float(x.loc[i, "low"]) - tick
+            stop_price = float(x.loc[i, "high"]) + tick
+
+            fill_idx = find_fill_short(x, entry_price, i + 1, MAX_ENTRY_WAIT_BARS)
+            if fill_idx is None:
+                continue
+
+            row = {
+                "timeframe": tf_name,
+                "signal_time": x.loc[i, "ts"],
+                "entry_time": x.loc[fill_idx, "ts"],
+                "side": "short",
+                "entry_price": entry_price,
+                "stop_price": stop_price,
+            }
+            for rr in RRS:
+                row[f"rr_{rr}"] = simulate_tp_sl(x, fill_idx, "short", entry_price, stop_price, rr)
+            rows.append(row)
 
     return pd.DataFrame(rows)
 
@@ -304,7 +346,8 @@ def summarize(results: pd.DataFrame) -> pd.DataFrame:
             no_hit = int((rtf[col] == "no_hit").sum())
             skipped = int((rtf[col] == "skip").sum())
             trades = wins + losses + no_hit + skipped
-            denom = wins + losses  # taxa de acerto considerando só resolvidos
+
+            denom = wins + losses  # taxa de acerto só dos resolvidos
             win_rate = (wins / denom) if denom > 0 else np.nan
 
             summaries.append({
@@ -317,17 +360,17 @@ def summarize(results: pd.DataFrame) -> pd.DataFrame:
                 "skipped": skipped,
                 "win_rate": win_rate,
             })
-
     return pd.DataFrame(summaries)
 
 
 def save_markdown(summary_df: pd.DataFrame, path: str):
     with open(path, "w", encoding="utf-8") as f:
-        f.write(f"# Backtest (MEXC Perps) — {SYMBOL}\n\n")
+        f.write(f"# Backtest PFR (MEXC Perps) — {SYMBOL}\n\n")
         f.write(f"- Gerado em UTC: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}\n")
-        f.write(f"- Setup (padrão): filtro tendência MA + preço acima/abaixo\n")
-        f.write(f"- MA: `{MA_TYPE} {SHORT_MA}/{LONG_MA}` | ATR: `{ATR_PERIOD}` | ATR_MULT: `{ATR_MULT}` | MAX_HOLD_BARS: `{MAX_HOLD_BARS}`\n")
-        f.write(f"- Ambiguous (TP e SL no mesmo candle): `{AMBIGUOUS_POLICY}`\n\n")
+        f.write(f"- Timeframes: `{', '.join(TIMEFRAMES)}`\n")
+        f.write(f"- Tendência: SMA{SMA_SHORT}/SMA{SMA_LONG} (close acima/abaixo das duas + cruzamento)\n")
+        f.write(f"- Setup: PFR (buy/sell) com entrada 1 tick acima/abaixo do candle sinal\n")
+        f.write(f"- MAX_ENTRY_WAIT_BARS: `{MAX_ENTRY_WAIT_BARS}` | MAX_HOLD_BARS: `{MAX_HOLD_BARS}` | AMBIGUOUS_POLICY: `{AMBIGUOUS_POLICY}`\n\n")
 
         if summary_df.empty:
             f.write("Sem resultados.\n")
@@ -346,16 +389,20 @@ def save_markdown(summary_df: pd.DataFrame, path: str):
 def main():
     os.makedirs("results", exist_ok=True)
 
-    print(f"[info] SYMBOL={SYMBOL} TIMEFRAMES={TIMEFRAMES}")
-    print(f"[info] MA={MA_TYPE} {SHORT_MA}/{LONG_MA} | ATR={ATR_PERIOD} mult={ATR_MULT} | RRs={RRS} | MAX_HOLD_BARS={MAX_HOLD_BARS}")
+    print(f"[info] SYMBOL={SYMBOL}")
+    print(f"[info] TIMEFRAMES={TIMEFRAMES}")
+    print(f"[info] SMA={SMA_SHORT}/{SMA_LONG} | RRs={RRS}")
+    print(f"[info] MAX_ENTRY_WAIT_BARS={MAX_ENTRY_WAIT_BARS} MAX_HOLD_BARS={MAX_HOLD_BARS} AMBIGUOUS_POLICY={AMBIGUOUS_POLICY}")
+    print(f"[info] MAX_BARS_1H={MAX_BARS_1H} WINDOW_DAYS={WINDOW_DAYS} TICK_SIZE={TICK_SIZE}")
 
     # 1) baixa 1h máximo
-    df_1h = fetch_ohlcv_1h_max(SYMBOL, max_bars=20000, window_days=30)
+    df_1h = fetch_ohlcv_1h_max(SYMBOL, max_bars=MAX_BARS_1H, window_days=WINDOW_DAYS)
     if df_1h.empty:
         raise RuntimeError("Não consegui baixar candles 1h.")
 
     # 2) monta dataframes por TF (a partir do 1h)
     tf_map = {"1h": df_1h}
+
     if "2h" in TIMEFRAMES:
         tf_map["2h"] = resample_ohlcv(df_1h, "2H")
     if "4h" in TIMEFRAMES:
@@ -366,7 +413,7 @@ def main():
         # semana fechando domingo (UTC)
         tf_map["1w"] = resample_ohlcv(df_1h, "W-SUN")
 
-    # 3) backtest
+    # 3) backtest por TF
     all_results = []
     for tf in ["1h", "2h", "4h", "1d", "1w"]:
         if tf not in TIMEFRAMES:
@@ -375,19 +422,23 @@ def main():
         if df is None or df.empty:
             print(f"[warn] TF={tf}: sem dados. Pulando.")
             continue
-        if len(df) < (LONG_MA + ATR_PERIOD + 10):
+        if len(df) < (SMA_LONG + 10):
             print(f"[warn] TF={tf}: pouco histórico ({len(df)}). Pulando.")
             continue
-        res = backtest_for_df(df, tf)
+
+        res = backtest_pfr(df, tf)
         all_results.append(res)
 
-    results_df = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
+    trades_df = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
+    summary_df = summarize(trades_df)
 
-    summary_df = summarize(results_df)
+    trades_path = f"results/backtest_trades_{SYMBOL}.csv"
+    summary_path = f"results/backtest_summary_{SYMBOL}.csv"
+    md_path = f"results/backtest_summary_{SYMBOL}.md"
 
-    results_df.to_csv(f"results/backtest_trades_{SYMBOL}.csv", index=False)
-    summary_df.to_csv(f"results/backtest_summary_{SYMBOL}.csv", index=False)
-    save_markdown(summary_df, f"results/backtest_summary_{SYMBOL}.md")
+    trades_df.to_csv(trades_path, index=False)
+    summary_df.to_csv(summary_path, index=False)
+    save_markdown(summary_df, md_path)
 
     print("[info] Salvo em results/")
     print(summary_df.to_string(index=False))
@@ -395,3 +446,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
