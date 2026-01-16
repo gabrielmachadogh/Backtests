@@ -13,25 +13,30 @@ jobs:
     env:
       SYMBOL: BTC_USDT
       TIMEFRAMES: 1h,2h,4h,1d,1w
-
-      # só PFR e DL
       SETUPS: PFR,DL
 
       SMA_SHORT: "8"
       SMA_LONG: "80"
       SLOPE_LOOKBACK: "8"
+
       ATR_PERIOD: "14"
+      RSI_PERIOD: "14"
+      LOOKBACK_N: "20"
 
       RRS: "1,1.5,2"
       AMBIGUOUS_POLICY: loss
-
-      # solicitado: só entra se romper no próximo candle
       MAX_ENTRY_WAIT_BARS: "1"
       MAX_HOLD_BARS: "50"
 
       MAX_BARS_1H: "20000"
       WINDOW_DAYS: "30"
       TICK_SIZE: "0"
+
+      # análise
+      PCTS: "10,15,20,25,30,40,50,60"
+      PAIRWISE_BINS: "4"
+      MIN_TRADES: "30"
+      TOP_K_BEST: "20"
 
       DEBUG: "0"
 
@@ -49,10 +54,13 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run backtest
+      - name: Run backtest (creates trades + summary)
         run: python backtest.py
 
-      - name: Commit backtest outputs to repo
+      - name: Analyze patterns (univariate + pairwise)
+        run: python analyze_patterns.py
+
+      - name: Commit outputs to repo
         run: |
           git pull --rebase || true
 
@@ -61,17 +69,12 @@ jobs:
 
           git add \
             "results/backtest_trades_${SYMBOL}.csv" \
-            "results/backtest_summary_${SYMBOL}.md" \
             "results/backtest_summary_${SYMBOL}.csv" \
+            "results/backtest_summary_${SYMBOL}.md" \
+            "results/patterns_univariate_${SYMBOL}.csv" \
+            "results/patterns_pairwise_${SYMBOL}.csv" \
+            "results/patterns_best_${SYMBOL}.md" \
             || true
 
-          git commit -m "update backtest outputs ${SYMBOL}" || echo "no changes to commit"
+          git commit -m "update backtest + patterns ${SYMBOL}" || echo "no changes to commit"
           git push
-
-      - name: Upload results (artifact)
-        uses: actions/upload-artifact@v4
-        with:
-          name: backtest-${{ github.run_id }}
-          overwrite: true
-          if-no-files-found: ignore
-          path: results/**
