@@ -1,6 +1,6 @@
 # Summary — BTC_USDT
 
-- Gerado em UTC: 2026-01-16 21:56:09
+- Gerado em UTC: 2026-01-16 22:37:33
 - Timeframes: `1h, 2h, 4h, 1d, 1w`
 - Setups: `PFR, DL`
 - SMA: 8/80 | slope lookback: 8
