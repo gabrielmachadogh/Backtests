@@ -16,7 +16,7 @@ jobs:
       SETUPS: PFR,DL,IB
       SMA_SHORT: "10"
       SMA_LONG: "100"
-      SLOPE_LOOKBACK: "1"
+      SLOPE_PERIOD: "5"
       RRS: "1,1.5,2"
       AMBIGUOUS_POLICY: loss
       MAX_ENTRY_WAIT_BARS: "3"
@@ -61,4 +61,3 @@ jobs:
           overwrite: true
           if-no-files-found: ignore
           path: results/**
-          
