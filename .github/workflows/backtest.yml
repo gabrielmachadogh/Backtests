@@ -23,6 +23,10 @@ jobs:
       RSI_PERIOD: "14"
       LOOKBACK_N: "20"
 
+      # NOVO (novo topo/fundo)
+      EXTREME_LOOKBACK: "20"
+      EXTREME_MAX_AGE: "50"
+
       RRS: "1,1.5,2"
       AMBIGUOUS_POLICY: loss
       MAX_ENTRY_WAIT_BARS: "1"
