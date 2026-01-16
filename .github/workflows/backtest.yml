@@ -1,4 +1,4 @@
-name: backtest-mexc-pfr
+name: backtest-long-only
 
 on:
   workflow_dispatch:
@@ -12,74 +12,41 @@ jobs:
 
     env:
       SYMBOL: BTC_USDT
-      TIMEFRAMES: 1h,2h,4h,1d,1w
+      TIMEFRAMES: 1h,2h,4h,1d
       SETUPS: PFR,DL
-
+      
+      # Parâmetros
       SMA_SHORT: "8"
       SMA_LONG: "80"
       SLOPE_LOOKBACK: "8"
-
       ATR_PERIOD: "14"
       RSI_PERIOD: "14"
-      LOOKBACK_N: "20"
-
-      EXTREME_LOOKBACK: "20"
-      EXTREME_MAX_AGE: "50"
-
-      RRS: "1,1.5,2"
-      AMBIGUOUS_POLICY: loss
+      
+      # Regras de Ouro
       MAX_ENTRY_WAIT_BARS: "1"
-      MAX_HOLD_BARS: "50"
-
-      MAX_BARS_1H: "20000"
+      AMBIGUOUS_POLICY: loss
+      
+      # Histórico
+      MAX_BARS_1H: "25000"
       WINDOW_DAYS: "30"
-      TICK_SIZE: "0"
-
-      # análise
-      PCTS: "10,15,20,25,30,40,50,60"
-      PAIRWISE_BINS: "4"
-      PAIRWISE_MAX_FEATURES: "25"
-      PAIRWISE_MAX_ROWS: "50000"
-      MIN_TRADES: "30"
-      TOP_K_BEST: "20"
-
-      DEBUG: "0"
+      
+      RRS: "1,1.5,2"
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install deps
-        run: pip install -r requirements.txt
-
-      - name: Run backtest (creates trades + summary)
+      - run: pip install pandas numpy requests tabulate
+      
+      - name: Run Backtest
         run: python backtest.py
-
-      - name: Analyze patterns (univariate + pairwise, by side)
-        run: python analyze_patterns.py
-
-      - name: Commit outputs to repo
+        
+      - name: Commit Results
         run: |
-          git pull --rebase || true
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add \
-            "results/backtest_trades_${SYMBOL}.csv" \
-            "results/backtest_summary_${SYMBOL}.csv" \
-            "results/backtest_summary_${SYMBOL}.md" \
-            "results/patterns_univariate_${SYMBOL}.csv" \
-            "results/patterns_pairwise_${SYMBOL}.csv" \
-            "results/patterns_best_${SYMBOL}.md" \
-            || true
-
-          git commit -m "update backtest + patterns ${SYMBOL}" || echo "no changes to commit"
+          git pull --rebase || true
+          git add results/* || true
+          git commit -m "Updated Long-Only Analysis" || echo "no changes"
           git push
