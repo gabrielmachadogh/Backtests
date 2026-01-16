@@ -1,4 +1,4 @@
-name: backtest-mexc
+name: backtest-mexc-pfr
 
 on:
   workflow_dispatch:
@@ -25,14 +25,15 @@ jobs:
         env:
           SYMBOL: BTC_USDT
           TIMEFRAMES: 1h,2h,4h,1d,1w
-          SHORT_MA: "10"
-          LONG_MA: "100"
-          MA_TYPE: sma
-          ATR_PERIOD: "14"
-          ATR_MULT: "1.0"
-          MAX_HOLD_BARS: "50"
+          SMA_SHORT: "10"
+          SMA_LONG: "100"
           RRS: "1,1.5,2,3"
           AMBIGUOUS_POLICY: loss
+          MAX_ENTRY_WAIT_BARS: "10"
+          MAX_HOLD_BARS: "50"
+          MAX_BARS_1H: "20000"
+          WINDOW_DAYS: "30"
+          TICK_SIZE: "0"
           DEBUG: "0"
 
       - name: Upload results (artifact)
