@@ -18,7 +18,7 @@ jobs:
       SMA_LONG: "100"
       RRS: "1,1.5,2,3"
       AMBIGUOUS_POLICY: loss
-      MAX_ENTRY_WAIT_BARS: "10"
+      MAX_ENTRY_WAIT_BARS: "3"
       MAX_HOLD_BARS: "50"
       MAX_BARS_1H: "20000"
       WINDOW_DAYS: "30"
@@ -53,34 +53,6 @@ jobs:
           git commit -m "update backtest summary ${SYMBOL}" || echo "no changes to commit"
           git push
 
-      - name: Upload results (artifact)
-        uses: actions/upload-artifact@v4
-        with:
-          name: backtest-${{ github.run_id }}
-          overwrite: true
-          if-no-files-found: ignore
-          path: results/**
-      - name: Install deps
-        run: pip install -r requirements.txt
-
-      - name: Run backtest
-        run: python backtest.py
-
-      # Faz commit apenas do RESUMO (md/csv) para você ler no GitHub
-      - name: Commit backtest summary to repo
-        run: |
-          git pull --rebase || true
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          ls -la results || true
-
-          git add "results/backtest_summary_${SYMBOL}.md" "results/backtest_summary_${SYMBOL}.csv" || true
-          git commit -m "update backtest summary ${SYMBOL}" || echo "no changes to commit"
-          git push
-
-      # (Opcional) mantém artifact com tudo (inclusive trades) para baixar se quiser
       - name: Upload results (artifact)
         uses: actions/upload-artifact@v4
         with:
