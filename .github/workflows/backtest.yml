@@ -23,7 +23,6 @@ jobs:
       RSI_PERIOD: "14"
       LOOKBACK_N: "20"
 
-      # NOVO (novo topo/fundo)
       EXTREME_LOOKBACK: "20"
       EXTREME_MAX_AGE: "50"
 
@@ -39,6 +38,8 @@ jobs:
       # análise
       PCTS: "10,15,20,25,30,40,50,60"
       PAIRWISE_BINS: "4"
+      PAIRWISE_MAX_FEATURES: "25"
+      PAIRWISE_MAX_ROWS: "50000"
       MIN_TRADES: "30"
       TOP_K_BEST: "20"
 
@@ -61,7 +62,7 @@ jobs:
       - name: Run backtest (creates trades + summary)
         run: python backtest.py
 
-      - name: Analyze patterns (univariate + pairwise)
+      - name: Analyze patterns (univariate + pairwise, by side)
         run: python analyze_patterns.py
 
       - name: Commit outputs to repo
