@@ -20,14 +20,19 @@ SLOPE_LOOKBACK = int(os.getenv("SLOPE_LOOKBACK", "8"))
 # ATR / RSI / janelas auxiliares
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-LOOKBACK_N = int(os.getenv("LOOKBACK_N", "20"))  # para high/low range, vol_z, etc.
+LOOKBACK_N = int(os.getenv("LOOKBACK_N", "20"))  # range, vol_z, etc.
+
+# "novo topo/fundo" (contexto)
+EXTREME_LOOKBACK = int(os.getenv("EXTREME_LOOKBACK", "20"))  # define o que é "novo topo/fundo"
+# (não vira regra; só feature. você pode filtrar depois)
+EXTREME_MAX_AGE = int(os.getenv("EXTREME_MAX_AGE", "50"))    # só para criar flag (opcional)
 
 # RRs
 RRS = [float(x) for x in os.getenv("RRS", "1,1.5,2").split(",")]
 
 # Execução
 AMBIGUOUS_POLICY = os.getenv("AMBIGUOUS_POLICY", "loss").lower()  # loss|win|skip
-MAX_ENTRY_WAIT_BARS = int(os.getenv("MAX_ENTRY_WAIT_BARS", "1"))   # solicitado
+MAX_ENTRY_WAIT_BARS = int(os.getenv("MAX_ENTRY_WAIT_BARS", "1"))   # seu padrão atual
 MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "50"))
 
 # Histórico
@@ -198,6 +203,43 @@ def add_rsi(df: pd.DataFrame, period: int) -> pd.DataFrame:
     return x
 
 
+def add_extreme_context(x: pd.DataFrame) -> pd.DataFrame:
+    """
+    Marca e carrega:
+      - novo topo (new_high_event) e último topo + idade + pullback
+      - novo fundo (new_low_event) e último fundo + idade + pullback
+    """
+    out = x.copy()
+    prev_max_high = out["high"].shift(1).rolling(EXTREME_LOOKBACK).max()
+    prev_min_low = out["low"].shift(1).rolling(EXTREME_LOOKBACK).min()
+
+    out["new_high_event"] = out["high"] > prev_max_high
+    out["new_low_event"] = out["low"] < prev_min_low
+
+    idx = np.arange(len(out), dtype=float)
+
+    last_hi_idx = pd.Series(np.where(out["new_high_event"].to_numpy(), idx, np.nan)).ffill()
+    last_lo_idx = pd.Series(np.where(out["new_low_event"].to_numpy(), idx, np.nan)).ffill()
+
+    out["bars_since_new_high"] = idx - last_hi_idx
+    out["bars_since_new_low"] = idx - last_lo_idx
+
+    last_hi_price = pd.Series(np.where(out["new_high_event"].to_numpy(), out["high"].to_numpy(), np.nan)).ffill()
+    last_lo_price = pd.Series(np.where(out["new_low_event"].to_numpy(), out["low"].to_numpy(), np.nan)).ffill()
+
+    out["last_new_high_price"] = last_hi_price
+    out["last_new_low_price"] = last_lo_price
+
+    out["pullback_from_new_high_pct"] = (out["last_new_high_price"] - out["close"]) / out["last_new_high_price"] * 100.0
+    out["pullback_from_new_low_pct"] = (out["close"] - out["last_new_low_price"]) / out["last_new_low_price"] * 100.0
+
+    # flags opcionais
+    out["after_new_high_flag"] = ((out["bars_since_new_high"] >= 1) & (out["bars_since_new_high"] <= EXTREME_MAX_AGE)).astype(int)
+    out["after_new_low_flag"] = ((out["bars_since_new_low"] >= 1) & (out["bars_since_new_low"] <= EXTREME_MAX_AGE)).astype(int)
+
+    return out
+
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
 
@@ -209,7 +251,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     x["trend_up"] = ((x["close"] > x["sma_s"]) & (x["close"] > x["sma_l"]) & (x["sma_s"] > x["sma_l"]))
     x["trend_down"] = ((x["close"] < x["sma_s"]) & (x["close"] < x["sma_l"]) & (x["sma_s"] < x["sma_l"]))
 
-    # inclinação: acima/abaixo do último N (máximo/mínimo)
+    # inclinação (acima/abaixo do último N)
     prev_max = x["sma_s"].shift(1).rolling(SLOPE_LOOKBACK).max()
     prev_min = x["sma_s"].shift(1).rolling(SLOPE_LOOKBACK).min()
     x["slope_up"] = x["sma_s"] > prev_max
@@ -240,7 +282,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     x["upper_wick_pct"] = (x["upper_wick"] / x["range"].replace(0, np.nan)) * 100.0
     x["lower_wick_pct"] = (x["lower_wick"] / x["range"].replace(0, np.nan)) * 100.0
 
-    # CLV (close location)
+    # CLV
     denom = x["range"].replace(0, np.nan)
     x["clv"] = (x["close"] - x["low"]) / denom
 
@@ -248,7 +290,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     x["ma_gap_pct"] = (x["sma_s"] - x["sma_l"]) / x["sma_l"] * 100.0
     x["dist_to_sma80_pct"] = (x["close"] - x["sma_l"]) / x["sma_l"] * 100.0
 
-    # Posição no range dos últimos N candles
+    # Posição no range dos últimos N
     roll_hi = x["high"].rolling(LOOKBACK_N).max()
     roll_lo = x["low"].rolling(LOOKBACK_N).min()
     x["pos_in_range_n"] = (x["close"] - roll_lo) / (roll_hi - roll_lo).replace(0, np.nan)
@@ -260,6 +302,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     vol_mean = x["volume"].rolling(LOOKBACK_N).mean()
     vol_std = x["volume"].rolling(LOOKBACK_N).std().replace(0, np.nan)
     x["vol_z"] = (x["volume"] - vol_mean) / vol_std
+
+    # <<< NOVO: contexto de "novo topo/fundo" + pullback
+    x = add_extreme_context(x)
 
     return x
 
@@ -360,15 +405,20 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
     x = add_indicators(df).reset_index(drop=True)
     tick = TICK_SIZE if TICK_SIZE > 0 else infer_tick_size_from_prices(x["close"])
 
-    start = max(SMA_LONG + SLOPE_LOOKBACK + ATR_PERIOD + RSI_PERIOD + LOOKBACK_N + 10, 10)
+    start = max(SMA_LONG + SLOPE_LOOKBACK + ATR_PERIOD + RSI_PERIOD + LOOKBACK_N + EXTREME_LOOKBACK + 10, 20)
     rows = []
 
     def snapshot_features(i: int, side: str) -> dict:
-        # slope_strength unificado (positivo)
         if side == "long":
             slope_strength = x.loc[i, "slope_strength_up"]
+            ctx_age = x.loc[i, "bars_since_new_high"]
+            ctx_pull = x.loc[i, "pullback_from_new_high_pct"]
+            ctx_flag = x.loc[i, "after_new_high_flag"]
         else:
             slope_strength = x.loc[i, "slope_strength_down"]
+            ctx_age = x.loc[i, "bars_since_new_low"]
+            ctx_pull = x.loc[i, "pullback_from_new_low_pct"]
+            ctx_flag = x.loc[i, "after_new_low_flag"]
 
         keys = [
             "ma_gap_pct", "dist_to_sma80_pct", "atr_pct", "clv", "range_pct",
@@ -377,8 +427,21 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
             "rsi", "pos_in_range_n",
             "dist_to_high_n_pct", "dist_to_low_n_pct",
             "vol_z",
+
+            # novos (globais)
+            "bars_since_new_high", "pullback_from_new_high_pct",
+            "bars_since_new_low", "pullback_from_new_low_pct",
         ]
-        out = {"slope_strength": float(slope_strength) if pd.notna(slope_strength) else np.nan}
+
+        out = {
+            "slope_strength": float(slope_strength) if pd.notna(slope_strength) else np.nan,
+
+            # side-aware (o que você quer analisar)
+            "context_bars_since_extreme": float(ctx_age) if pd.notna(ctx_age) else np.nan,
+            "context_pullback_pct": float(ctx_pull) if pd.notna(ctx_pull) else np.nan,
+            "context_after_extreme_flag": int(ctx_flag) if pd.notna(ctx_flag) else 0,
+        }
+
         for k in keys:
             out[k] = float(x.loc[i, k]) if (k in x.columns and pd.notna(x.loc[i, k])) else np.nan
         return out
@@ -414,7 +477,6 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
         rows.append(row)
 
     for i in range(start, len(x) - 1):
-        # NaNs básicos
         if pd.isna(x.loc[i, "sma_s"]) or pd.isna(x.loc[i, "sma_l"]):
             continue
 
@@ -423,14 +485,12 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
         slope_up = bool(x.loc[i, "slope_up"])
         slope_down = bool(x.loc[i, "slope_down"])
 
-        # compra
         if trend_up and slope_up:
             if "PFR" in SETUPS and pfr_buy_signal(x, i):
                 add_trade(i, "PFR", "long")
             if "DL" in SETUPS and dl_buy_signal(x, i):
                 add_trade(i, "DL", "long")
 
-        # venda
         if trend_down and slope_down:
             if "PFR" in SETUPS and pfr_sell_signal(x, i):
                 add_trade(i, "PFR", "short")
@@ -490,6 +550,7 @@ def save_md_summary(summary_df: pd.DataFrame, path: str):
         f.write(f"- Timeframes: `{', '.join(TIMEFRAMES)}`\n")
         f.write(f"- Setups: `{', '.join(SETUPS)}`\n")
         f.write(f"- SMA: {SMA_SHORT}/{SMA_LONG} | slope lookback: {SLOPE_LOOKBACK}\n")
+        f.write(f"- Novo topo/fundo: EXTREME_LOOKBACK={EXTREME_LOOKBACK}, EXTREME_MAX_AGE={EXTREME_MAX_AGE}\n")
         f.write(f"- MAX_ENTRY_WAIT_BARS: {MAX_ENTRY_WAIT_BARS}\n")
         f.write(f"- RRs: {RRS}\n\n")
 
@@ -527,14 +588,13 @@ def main():
         df_tf = tf_map.get(tf)
         if df_tf is None or df_tf.empty:
             continue
-        min_len = SMA_LONG + SLOPE_LOOKBACK + ATR_PERIOD + RSI_PERIOD + LOOKBACK_N + 50
+        min_len = SMA_LONG + SLOPE_LOOKBACK + ATR_PERIOD + RSI_PERIOD + LOOKBACK_N + EXTREME_LOOKBACK + 80
         if len(df_tf) < min_len:
             continue
         all_trades.append(backtest_setups(df_tf, tf))
 
     trades_df = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
 
-    # sempre salvar o dataset de trades
     trades_df.to_csv(f"results/backtest_trades_{SYMBOL}.csv", index=False)
 
     summary_df = summarize(trades_df)
@@ -544,3 +604,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
