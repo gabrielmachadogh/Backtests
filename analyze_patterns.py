@@ -9,8 +9,8 @@ RRS = [float(x) for x in os.getenv("RRS", "1,1.5,2").split(",")]
 PCTS = [int(x) for x in os.getenv("PCTS", "10,15,20,25,30,40,50,60").split(",")]
 
 PAIRWISE_BINS = int(os.getenv("PAIRWISE_BINS", "4"))                  # 4 = quartis
-PAIRWISE_MAX_FEATURES = int(os.getenv("PAIRWISE_MAX_FEATURES", "25")) # limita features p/ pairwise
-PAIRWISE_MAX_ROWS = int(os.getenv("PAIRWISE_MAX_ROWS", "50000"))      # 0 = sem limite
+PAIRWISE_MAX_FEATURES = int(os.getenv("PAIRWISE_MAX_FEATURES", "25")) # limita features no pairwise
+PAIRWISE_MAX_ROWS = int(os.getenv("PAIRWISE_MAX_ROWS", "50000"))      # top rows por win_rate/trades
 
 MIN_TRADES = int(os.getenv("MIN_TRADES", "30"))
 TOP_K_BEST = int(os.getenv("TOP_K_BEST", "20"))
@@ -52,7 +52,6 @@ def melt_outcomes(trades: pd.DataFrame) -> pd.DataFrame:
     long_df["rr"] = long_df["rr_col"].str.replace("rr_", "", regex=False).astype(float)
     long_df = long_df.drop(columns=["rr_col"])
 
-    # só resolvidos para winrate
     long_df = long_df[long_df["outcome"].isin(["win", "loss"])].copy()
 
     for c in ["timeframe", "setup", "side", "rr", "outcome"]:
@@ -91,7 +90,6 @@ def is_discrete_feature(series: pd.Series) -> bool:
     s = safe_numeric(series).dropna()
     if s.empty:
         return False
-    # poucos valores -> tratar como discreto (0/1, flags, categorias numéricas)
     return s.nunique() <= 6
 
 
@@ -123,35 +121,29 @@ def univariate_report(long_df: pd.DataFrame, features: list[str]) -> pd.DataFram
             if gg.shape[0] < MIN_TRADES:
                 continue
 
-            # ALL
             base = {"timeframe": tf, "setup": setup, "side": side, "rr": rr, "feature": feat, "bucket": "ALL"}
             base.update(stats_from_subset(gg))
             base.update({"thr_lo": np.nan, "thr_hi": np.nan})
             rows.append(base)
 
-            # discreto -> buckets por valor (sem converter para int!)
             if is_discrete_feature(gg[feat]):
-                # usa string segura do valor
+                # agrupa por valor (como string numérica)
                 values = gg[feat].map(lambda x: f"{float(x):g}" if pd.notna(x) else np.nan)
                 gg2 = gg.copy()
                 gg2["_val"] = values
-
                 for v, sub in gg2.groupby("_val", dropna=True):
                     if sub.shape[0] < MIN_TRADES:
                         continue
                     row = {"timeframe": tf, "setup": setup, "side": side, "rr": rr, "feature": feat, "bucket": f"val={v}"}
                     row.update(stats_from_subset(sub))
-                    # thr_lo/thr_hi só faz sentido em contínuas; aqui guarda o valor
                     try:
                         vv = float(v)
                     except Exception:
                         vv = np.nan
                     row.update({"thr_lo": vv, "thr_hi": vv})
                     rows.append(row)
-
                 continue
 
-            # low/high percentis (contínuas)
             for p in PCTS:
                 q_lo = gg[feat].quantile(p / 100.0)
                 q_hi = gg[feat].quantile(1.0 - p / 100.0)
@@ -171,34 +163,30 @@ def univariate_report(long_df: pd.DataFrame, features: list[str]) -> pd.DataFram
                     row.update({"thr_lo": float(q_hi), "thr_hi": np.nan})
                     rows.append(row)
 
-    cols = ["timeframe", "setup", "side", "rr", "feature", "bucket", "trades", "wins", "losses", "win_rate", "win_rate_pct", "thr_lo", "thr_hi"]
+    cols = ["timeframe", "setup", "side", "rr", "feature", "bucket",
+            "trades", "wins", "losses", "win_rate", "win_rate_pct", "thr_lo", "thr_hi"]
     return pd.DataFrame(rows, columns=cols)
 
 
 def make_bins(series: pd.Series, n_bins: int):
     """
     Retorna (bin_labels, bin_ranges)
-      - bin_labels: Series com labels (int bins ou string valores)
-      - bin_ranges: dict bin_label -> (lo, hi) para contínuas; vazio para discretas
+      - discreto: labels = string do valor, ranges={}
+      - contínuo: labels = códigos 0..k-1, ranges{code: (lo,hi)}
     """
     s = safe_numeric(series)
-
     s_ok = s.dropna()
     if s_ok.empty:
         return None, {}
 
-    # discreto -> usar string do valor (SEM astype Int64)
     if s_ok.nunique() <= 6:
         labels = s.map(lambda x: f"{float(x):g}" if pd.notna(x) else np.nan)
         return labels, {}
 
-    # contínuo -> qcut + ranges
     try:
         cats, edges = pd.qcut(s, q=n_bins, retbins=True, duplicates="drop")
         codes = pd.Series(cats.cat.codes, index=s.index)
-        ranges = {}
-        for i in range(len(edges) - 1):
-            ranges[i] = (float(edges[i]), float(edges[i + 1]))
+        ranges = {i: (float(edges[i]), float(edges[i + 1])) for i in range(len(edges) - 1)}
         return codes, ranges
     except Exception:
         return None, {}
@@ -207,7 +195,6 @@ def make_bins(series: pd.Series, n_bins: int):
 def pairwise_report(long_df: pd.DataFrame, features: list[str]) -> pd.DataFrame:
     rows = []
     group_cols = ["timeframe", "setup", "side", "rr"]
-
     feats = features[:PAIRWISE_MAX_FEATURES]
 
     for (tf, setup, side, rr), g in long_df.groupby(group_cols, dropna=False):
@@ -245,7 +232,64 @@ def pairwise_report(long_df: pd.DataFrame, features: list[str]) -> pd.DataFrame:
                 a_lo, a_hi = (np.nan, np.nan)
                 b_lo, b_hi = (np.nan, np.nan)
 
-                # ranges só existem para contínuas (bins int)
+                # ranges só existem quando bin é inteiro (contínuo)
                 if isinstance(ba, (int, np.integer)) and int(ba) in range_cache[a]:
                     a_lo, a_hi = range_cache[a][int(ba)]
-                if isinstance(bb, (int, 
+                if isinstance(bb, (int, np.integer)) and int(bb) in range_cache[b]:
+                    b_lo, b_hi = range_cache[b][int(bb)]
+
+                row = {
+                    "timeframe": tf,
+                    "setup": setup,
+                    "side": side,
+                    "rr": rr,
+                    "feature_a": a,
+                    "feature_b": b,
+                    "bin_a": str(ba),
+                    "bin_b": str(bb),
+                    "bin_a_lo": a_lo,
+                    "bin_a_hi": a_hi,
+                    "bin_b_lo": b_lo,
+                    "bin_b_hi": b_hi,
+                }
+                row.update(st)
+                rows.append(row)
+
+    cols = [
+        "timeframe", "setup", "side", "rr",
+        "feature_a", "feature_b",
+        "bin_a", "bin_b",
+        "bin_a_lo", "bin_a_hi", "bin_b_lo", "bin_b_hi",
+        "trades", "wins", "losses", "win_rate", "win_rate_pct"
+    ]
+    df = pd.DataFrame(rows, columns=cols)
+
+    if PAIRWISE_MAX_ROWS > 0 and not df.empty:
+        df = df.sort_values(["win_rate", "trades"], ascending=[False, False]).head(PAIRWISE_MAX_ROWS)
+
+    return df
+
+
+def best_patterns_md(uni: pd.DataFrame, path: str):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"# Best patterns (by side) — {SYMBOL}\n\n")
+        f.write(f"- MIN_TRADES: {MIN_TRADES}\n")
+        f.write(f"- Buckets: low/high {PCTS}\n")
+        f.write(f"- Thresholds: thr_lo/thr_hi\n\n")
+
+        if uni.empty:
+            f.write("Sem dados.\n")
+            return
+
+        for (tf, setup, side, rr), g in uni.groupby(["timeframe", "setup", "side", "rr"]):
+            g2 = g[g["bucket"] != "ALL"].copy()
+            g2 = g2.dropna(subset=["win_rate"])
+            g2 = g2.sort_values(["win_rate", "trades"], ascending=[False, False]).head(TOP_K_BEST)
+
+            f.write(f"## {tf} | {setup} | {side} | RR {rr}\n\n")
+            f.write("| Feature | Bucket | Trades | WinRate | thr_lo | thr_hi |\n")
+            f.write("|---|---|---:|---:|---:|---:|\n")
+            for _, r in g2.iterrows():
+                thr_lo = "" if pd.isna(r["thr_lo"]) else f"{r['thr_lo']:.6g}"
+                thr_hi = "" if pd.isna(r["thr_hi"]) else f"{r['thr_hi']:.6g}"
+                f.write(f"| {r['feature']} | {r['bucket']} | {int(r['trades'])} | {r['win_rate_pct']} | 
