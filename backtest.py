@@ -24,8 +24,8 @@ RRS = [float(x) for x in os.getenv("RRS", "1,1.5,2,3").split(",")]
 # Se no mesmo candle bater TP e SL
 AMBIGUOUS_POLICY = os.getenv("AMBIGUOUS_POLICY", "loss").lower()  # loss|win|skip
 
-# Máximo tempo para a ordem "pegar" após o candle do sinal
-MAX_ENTRY_WAIT_BARS = int(os.getenv("MAX_ENTRY_WAIT_BARS", "10"))
+# Máximo tempo para a ordem "pegar" após o candle do sinal (AGORA default = 3)
+MAX_ENTRY_WAIT_BARS = int(os.getenv("MAX_ENTRY_WAIT_BARS", "3"))
 
 # Máximo tempo para bater TP/SL depois de entrar
 MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "50"))
@@ -303,13 +303,13 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
     tick = TICK_SIZE if TICK_SIZE > 0 else infer_tick_size_from_prices(x["close"])
 
     if DEBUG:
-        print(f"[debug] {tf_name}: bars={len(x)} tick={tick} setups={SETUPS}")
+        print(f"[debug] {tf_name}: bars={len(x)} tick={tick} setups={SETUPS} MAX_ENTRY_WAIT_BARS={MAX_ENTRY_WAIT_BARS}")
 
     rows = []
     start = max(SMA_LONG + 2, 2)
 
     def add_trade(i: int, setup_name: str, side: str):
-        # Entrada sempre baseada no candle sinal i:
+        # Entrada baseada no candle sinal i:
         # long: 1 tick acima da máxima do candle sinal
         # short: 1 tick abaixo da mínima do candle sinal
         if side == "long":
