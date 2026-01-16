@@ -5,30 +5,32 @@ import numpy as np
 import pandas as pd
 
 BASE_URL = os.getenv("MEXC_CONTRACT_BASE_URL", "https://contract.mexc.com/api/v1")
-
 SYMBOL = os.getenv("SYMBOL", "BTC_USDT")
 
 # Timeframes desejados
 TIMEFRAMES = [x.strip().lower() for x in os.getenv("TIMEFRAMES", "1h,2h,4h,1d,1w").split(",") if x.strip()]
 
-# Quais setups rodar (PFR, DL, IB)
+# Setups
 SETUPS = [x.strip().upper() for x in os.getenv("SETUPS", "PFR,DL,IB").split(",") if x.strip()]
 
-# Médias FIXAS (apenas 8 e 80)
+# Médias fixas
 SMA_SHORT = int(os.getenv("SMA_SHORT", "8"))
 SMA_LONG = int(os.getenv("SMA_LONG", "80"))
 
-# Inclinação: média da variação da SMA curta nos últimos N candles (default 5)
-SLOPE_PERIOD = int(os.getenv("SLOPE_PERIOD", "5"))
+# Inclinação (janela de comparação) — “acima dos últimos 8” / “abaixo dos últimos 8”
+SLOPE_LOOKBACK = int(os.getenv("SLOPE_LOOKBACK", "8"))
 
-# RRs para simular
+# ATR
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+
+# RRs
 RRS = [float(x) for x in os.getenv("RRS", "1,1.5,2").split(",")]
 
 # Se no mesmo candle bater TP e SL
 AMBIGUOUS_POLICY = os.getenv("AMBIGUOUS_POLICY", "loss").lower()  # loss|win|skip
 
-# Máximo tempo para a ordem "pegar" após o candle do sinal (máx 3 candles)
-MAX_ENTRY_WAIT_BARS = int(os.getenv("MAX_ENTRY_WAIT_BARS", "3"))
+# Máximo tempo para a ordem "pegar" após o candle do sinal
+MAX_ENTRY_WAIT_BARS = int(os.getenv("MAX_ENTRY_WAIT_BARS", "2"))
 
 # Máximo tempo para bater TP/SL depois de entrar
 MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "50"))
@@ -37,12 +39,16 @@ MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "50"))
 MAX_BARS_1H = int(os.getenv("MAX_BARS_1H", "20000"))
 WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", "30"))
 
-# Tick size (se 0, ele infere pelo número de casas do preço)
+# Tick size (se 0, inferir)
 TICK_SIZE = float(os.getenv("TICK_SIZE", "0"))
+
+# Relatório por buckets
+TOP_BUCKET = float(os.getenv("TOP_BUCKET", "0.30"))  # top 30%
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
 
+# -------------------- util --------------------
 def fmt_pct(win_rate) -> str:
     """Formata taxa de acerto como 43,2% (máx 3 dígitos antes do %)."""
     try:
@@ -198,18 +204,55 @@ def infer_tick_size_from_prices(close_series: pd.Series) -> float:
     return 1.0
 
 
-# -------------------- tendência + filtros --------------------
+def add_atr(df: pd.DataFrame, period: int) -> pd.DataFrame:
+    x = df.copy()
+    prev_close = x["close"].shift(1)
+    tr = pd.concat([
+        (x["high"] - x["low"]).abs(),
+        (x["high"] - prev_close).abs(),
+        (x["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    x["atr"] = tr.rolling(period).mean()
+    return x
+
+
+# -------------------- indicadores e filtros --------------------
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
     x["sma_s"] = sma(x["close"], SMA_SHORT)
     x["sma_l"] = sma(x["close"], SMA_LONG)
 
+    # tendência base
     x["trend_up"] = ((x["close"] > x["sma_s"]) & (x["close"] > x["sma_l"]) & (x["sma_s"] > x["sma_l"]))
     x["trend_down"] = ((x["close"] < x["sma_s"]) & (x["close"] < x["sma_l"]) & (x["sma_s"] < x["sma_l"]))
 
-    x["slope"] = x["sma_s"].diff().rolling(SLOPE_PERIOD).mean()
-    x["slope_up"] = x["slope"] > 0
-    x["slope_down"] = x["slope"] < 0
+    # Inclinação forte (últimos 8): SMA curta precisa estar acima do máximo anterior (compra)
+    # e abaixo do mínimo anterior (venda).
+    prev_max = x["sma_s"].shift(1).rolling(SLOPE_LOOKBACK).max()
+    prev_min = x["sma_s"].shift(1).rolling(SLOPE_LOOKBACK).min()
+
+    x["slope_up"] = x["sma_s"] > prev_max
+    x["slope_down"] = x["sma_s"] < prev_min
+
+    # Força da inclinação (para ranking/relatório)
+    x["slope_strength_up"] = x["sma_s"] - prev_max
+    x["slope_strength_down"] = prev_min - x["sma_s"]
+
+    # Gap e distância
+    x["ma_gap_pct"] = (x["sma_s"] - x["sma_l"]) / x["sma_l"] * 100.0
+    x["dist_to_smaL_pct"] = (x["close"] - x["sma_l"]) / x["sma_l"] * 100.0
+
+    # ATR e ATR%
+    x = add_atr(x, ATR_PERIOD)
+    x["atr_pct"] = (x["atr"] / x["close"]) * 100.0
+
+    # ranges
+    x["range"] = (x["high"] - x["low"])
+    x["range_pct"] = (x["range"] / x["close"]) * 100.0
+
+    # CLV (Close Location Value)
+    denom = (x["high"] - x["low"]).replace(0, np.nan)
+    x["clv"] = (x["close"] - x["low"]) / denom
 
     return x
 
@@ -239,11 +282,22 @@ def dl_sell_signal(x: pd.DataFrame, i: int) -> bool:
     return (x.loc[i, "high"] > x.loc[i - 1, "high"]) and (x.loc[i, "high"] > x.loc[i - 2, "high"])
 
 
-def ib_signal(x: pd.DataFrame, i: int) -> bool:
-    return (x.loc[i, "high"] <= x.loc[i - 1, "high"]) and (x.loc[i, "low"] >= x.loc[i - 1, "low"])
+def ib_signal_filtered(x: pd.DataFrame, i: int) -> bool:
+    # inside bar: high <= high anterior e low >= low anterior
+    inside = (x.loc[i, "high"] <= x.loc[i - 1, "high"]) and (x.loc[i, "low"] >= x.loc[i - 1, "low"])
+    if not inside:
+        return False
+
+    # filtro: range do inside bar <= 50% do range anterior
+    r_i = float(x.loc[i, "high"] - x.loc[i, "low"])
+    r_prev = float(x.loc[i - 1, "high"] - x.loc[i - 1, "low"])
+    if r_prev <= 0:
+        return False
+
+    return r_i <= 0.5 * r_prev
 
 
-# -------------------- execução/TP/SL --------------------
+# -------------------- execução / fill / TP/SL --------------------
 def find_fill_long(x: pd.DataFrame, entry_price: float, start_idx: int, max_wait: int):
     end = min(start_idx + max_wait, len(x))
     for j in range(start_idx, end):
@@ -316,37 +370,56 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
     x = add_indicators(df).reset_index(drop=True)
     tick = TICK_SIZE if TICK_SIZE > 0 else infer_tick_size_from_prices(x["close"])
 
+    # precisa de SMA_LONG, slope lookback e ATR
+    start = max(SMA_LONG + SLOPE_LOOKBACK + ATR_PERIOD + 5, 5)
     rows = []
-    start = max(SMA_LONG + 2, 2)
 
     def add_trade(i: int, setup_name: str, side: str):
+        # entrada por rompimento do candle do setup
         if side == "long":
             entry_price = float(x.loc[i, "high"]) + tick
             stop_price = float(x.loc[i, "low"]) - tick
             fill_idx = find_fill_long(x, entry_price, i + 1, MAX_ENTRY_WAIT_BARS)
+            slope_strength = float(x.loc[i, "slope_strength_up"]) if pd.notna(x.loc[i, "slope_strength_up"]) else np.nan
         else:
             entry_price = float(x.loc[i, "low"]) - tick
             stop_price = float(x.loc[i, "high"]) + tick
             fill_idx = find_fill_short(x, entry_price, i + 1, MAX_ENTRY_WAIT_BARS)
+            slope_strength = float(x.loc[i, "slope_strength_down"]) if pd.notna(x.loc[i, "slope_strength_down"]) else np.nan
 
         if fill_idx is None:
             return
 
+        fill_delay = int(fill_idx - i)  # 1 = próximo candle, 2 = dois candles depois
+
         row = {
             "timeframe": tf_name,
             "setup": setup_name,
+            "side": side,
             "signal_time": x.loc[i, "ts"],
             "entry_time": x.loc[fill_idx, "ts"],
-            "side": side,
+            "fill_delay": fill_delay,
             "entry_price": entry_price,
             "stop_price": stop_price,
+
+            # features do candle do sinal:
+            "ma_gap_pct": float(x.loc[i, "ma_gap_pct"]) if pd.notna(x.loc[i, "ma_gap_pct"]) else np.nan,
+            "dist_to_sma80_pct": float(x.loc[i, "dist_to_smaL_pct"]) if pd.notna(x.loc[i, "dist_to_smaL_pct"]) else np.nan,
+            "atr_pct": float(x.loc[i, "atr_pct"]) if pd.notna(x.loc[i, "atr_pct"]) else np.nan,
+            "clv": float(x.loc[i, "clv"]) if pd.notna(x.loc[i, "clv"]) else np.nan,
+            "range_pct": float(x.loc[i, "range_pct"]) if pd.notna(x.loc[i, "range_pct"]) else np.nan,
+            "slope_strength": slope_strength,
         }
+
+        # resultados por RR
         for rr in RRS:
             row[f"rr_{rr}"] = simulate_tp_sl(x, fill_idx, side, entry_price, stop_price, rr)
+
         rows.append(row)
 
     for i in range(start, len(x) - 1):
-        if pd.isna(x.loc[i, "sma_s"]) or pd.isna(x.loc[i, "sma_l"]) or pd.isna(x.loc[i, "slope"]):
+        # checagens de NaN
+        if pd.isna(x.loc[i, "sma_s"]) or pd.isna(x.loc[i, "sma_l"]) or pd.isna(x.loc[i, "atr_pct"]):
             continue
 
         trend_up = bool(x.loc[i, "trend_up"])
@@ -354,33 +427,35 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
         slope_up = bool(x.loc[i, "slope_up"])
         slope_down = bool(x.loc[i, "slope_down"])
 
+        # Compra: tendência de alta + inclinação (acima últimos 8)
         if trend_up and slope_up:
             if "PFR" in SETUPS and pfr_buy_signal(x, i):
                 add_trade(i, "PFR", "long")
             if "DL" in SETUPS and dl_buy_signal(x, i):
                 add_trade(i, "DL", "long")
-            if "IB" in SETUPS and ib_signal(x, i):
+            if "IB" in SETUPS and ib_signal_filtered(x, i):
                 add_trade(i, "IB", "long")
 
+        # Venda: tendência de baixa + inclinação (abaixo últimos 8)
         if trend_down and slope_down:
             if "PFR" in SETUPS and pfr_sell_signal(x, i):
                 add_trade(i, "PFR", "short")
             if "DL" in SETUPS and dl_sell_signal(x, i):
                 add_trade(i, "DL", "short")
-            if "IB" in SETUPS and ib_signal(x, i):
+            if "IB" in SETUPS and ib_signal_filtered(x, i):
                 add_trade(i, "IB", "short")
 
     return pd.DataFrame(rows)
 
 
-def summarize(results: pd.DataFrame) -> pd.DataFrame:
+def summarize(trades: pd.DataFrame) -> pd.DataFrame:
     cols = ["timeframe", "setup", "rr", "trades", "wins", "losses", "no_hit", "skipped", "win_rate", "win_rate_pct"]
-    if results.empty:
+    if trades.empty:
         return pd.DataFrame(columns=cols)
 
     summaries = []
-    for tf in sorted(results["timeframe"].unique()):
-        rtf = results[results["timeframe"] == tf]
+    for tf in sorted(trades["timeframe"].unique()):
+        rtf = trades[trades["timeframe"] == tf]
         for setup in sorted(rtf["setup"].unique()):
             rs = rtf[rtf["setup"] == setup]
             for rr in RRS:
@@ -389,7 +464,7 @@ def summarize(results: pd.DataFrame) -> pd.DataFrame:
                 losses = int((rs[col] == "loss").sum())
                 no_hit = int((rs[col] == "no_hit").sum())
                 skipped = int((rs[col] == "skip").sum())
-                trades = wins + losses + no_hit + skipped
+                trades_n = wins + losses + no_hit + skipped
 
                 denom = wins + losses
                 win_rate = (wins / denom) if denom > 0 else np.nan
@@ -398,7 +473,7 @@ def summarize(results: pd.DataFrame) -> pd.DataFrame:
                     "timeframe": tf,
                     "setup": setup,
                     "rr": rr,
-                    "trades": trades,
+                    "trades": trades_n,
                     "wins": wins,
                     "losses": losses,
                     "no_hit": no_hit,
@@ -410,16 +485,87 @@ def summarize(results: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(summaries, columns=cols)
 
 
-def save_markdown(summary_df: pd.DataFrame, path: str):
+def report_winrate_buckets(trades: pd.DataFrame, metric: str = "slope_strength", top_bucket: float = 0.30) -> pd.DataFrame:
+    """
+    Relatório: para cada (TF, Setup, RR) compara winrate do TOP X% do 'metric' vs resto.
+    """
+    cols = ["timeframe", "setup", "rr", "metric", "bucket", "trades", "wins", "losses", "win_rate", "win_rate_pct"]
+    if trades.empty or metric not in trades.columns:
+        return pd.DataFrame(columns=cols)
+
+    # expandir para formato longo por RR
+    rr_cols = [f"rr_{rr}" for rr in RRS]
+    long_df = trades[["timeframe", "setup", metric] + rr_cols].copy()
+    long_df = long_df.melt(id_vars=["timeframe", "setup", metric], value_vars=rr_cols, var_name="rr_col", value_name="outcome")
+    long_df["rr"] = long_df["rr_col"].str.replace("rr_", "", regex=False).astype(float)
+
+    # bucket por (TF, setup)
+    reports = []
+    for (tf, setup), g in long_df.groupby(["timeframe", "setup"], dropna=False):
+        g2 = g.dropna(subset=[metric]).copy()
+        if g2.empty:
+            continue
+
+        q = g2[metric].quantile(1.0 - top_bucket)
+        g2["bucket"] = np.where(g2[metric] >= q, f"top{int(top_bucket*100)}", f"rest{int((1-top_bucket)*100)}")
+
+        for rr, grr in g2.groupby("rr"):
+            # considera só resolvidos para winrate (wins/losses)
+            wins = int((grr["outcome"] == "win").sum())
+            losses = int((grr["outcome"] == "loss").sum())
+            trades_n = int(grr.shape[0])
+
+            denom = wins + losses
+            win_rate = (wins / denom) if denom > 0 else np.nan
+
+            reports.append({
+                "timeframe": tf,
+                "setup": setup,
+                "rr": rr,
+                "metric": metric,
+                "bucket": "ALL",
+                "trades": trades_n,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": win_rate,
+                "win_rate_pct": fmt_pct(win_rate),
+            })
+
+            for bucket_name, gb in grr.groupby("bucket"):
+                wins_b = int((gb["outcome"] == "win").sum())
+                losses_b = int((gb["outcome"] == "loss").sum())
+                trades_b = int(gb.shape[0])
+                denom_b = wins_b + losses_b
+                win_rate_b = (wins_b / denom_b) if denom_b > 0 else np.nan
+
+                reports.append({
+                    "timeframe": tf,
+                    "setup": setup,
+                    "rr": rr,
+                    "metric": metric,
+                    "bucket": bucket_name,
+                    "trades": trades_b,
+                    "wins": wins_b,
+                    "losses": losses_b,
+                    "win_rate": win_rate_b,
+                    "win_rate_pct": fmt_pct(win_rate_b),
+                })
+
+    return pd.DataFrame(reports, columns=cols)
+
+
+def save_markdown_summary(summary_df: pd.DataFrame, path: str):
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"# Backtest (MEXC Perps) — {SYMBOL}\n\n")
         f.write(f"- Gerado em UTC: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}\n")
         f.write(f"- Timeframes: `{', '.join(TIMEFRAMES)}`\n")
         f.write(f"- Médias: SMA{SMA_SHORT}/SMA{SMA_LONG}\n")
-        f.write(f"- Inclinação: média da variação da SMA{SMA_SHORT} nos últimos {SLOPE_PERIOD} candles (buy>0, sell<0)\n")
+        f.write(f"- Inclinação: SMA{SMA_SHORT} acima/abaixo dos últimos {SLOPE_LOOKBACK} valores\n")
+        f.write(f"- Inside Bar: range <= 50% do candle anterior\n")
+        f.write(f"- Fill max: {MAX_ENTRY_WAIT_BARS} candles\n")
+        f.write(f"- ATR: {ATR_PERIOD}\n")
         f.write(f"- Setups: `{', '.join(SETUPS)}`\n")
-        f.write(f"- RRs: `{', '.join([str(r) for r in RRS])}`\n")
-        f.write(f"- MAX_ENTRY_WAIT_BARS: `{MAX_ENTRY_WAIT_BARS}` | MAX_HOLD_BARS: `{MAX_HOLD_BARS}` | AMBIGUOUS_POLICY: `{AMBIGUOUS_POLICY}`\n\n")
+        f.write(f"- RRs: `{', '.join([str(r) for r in RRS])}`\n\n")
 
         if summary_df.empty:
             f.write("Sem resultados.\n")
@@ -433,8 +579,31 @@ def save_markdown(summary_df: pd.DataFrame, path: str):
             )
 
 
+def save_markdown_report(report_df: pd.DataFrame, path: str):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"# Relatório por faixas — {SYMBOL}\n\n")
+        f.write(f"- Métrica: `slope_strength`\n")
+        f.write(f"- Bucket: top {int(TOP_BUCKET*100)}% vs resto\n\n")
+
+        if report_df.empty:
+            f.write("Sem dados.\n")
+            return
+
+        f.write("| TF | Setup | RR | Bucket | Trades | Wins | Losses | WinRate |\n")
+        f.write("|---|---|---:|---|---:|---:|---:|---:|\n")
+        for _, r in report_df.iterrows():
+            f.write(
+                f"| {r['timeframe']} | {r['setup']} | {r['rr']} | {r['bucket']} | {int(r['trades'])} | {int(r['wins'])} | {int(r['losses'])} | {r.get('win_rate_pct','-')} |\n"
+            )
+
+
 def main():
     os.makedirs("results", exist_ok=True)
+
+    if DEBUG:
+        print("[debug] config:",
+              SYMBOL, TIMEFRAMES, SETUPS, SMA_SHORT, SMA_LONG, SLOPE_LOOKBACK,
+              ATR_PERIOD, RRS, MAX_ENTRY_WAIT_BARS, MAX_HOLD_BARS)
 
     df_1h = fetch_ohlcv_1h_max(SYMBOL, max_bars=MAX_BARS_1H, window_days=WINDOW_DAYS)
     if df_1h.empty:
@@ -457,18 +626,28 @@ def main():
         df_tf = tf_map.get(tf)
         if df_tf is None or df_tf.empty:
             continue
-        if len(df_tf) < (SMA_LONG + SLOPE_PERIOD + 10):
+        # histórico mínimo
+        min_len = SMA_LONG + SLOPE_LOOKBACK + ATR_PERIOD + 20
+        if len(df_tf) < min_len:
             continue
         all_trades.append(backtest_setups(df_tf, tf))
 
     trades_df = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+
+    # summary principal
     summary_df = summarize(trades_df)
 
+    # relatório buckets (top30 slope_strength vs resto)
+    report_df = report_winrate_buckets(trades_df, metric="slope_strength", top_bucket=TOP_BUCKET)
+
+    # salvar
     trades_df.to_csv(f"results/backtest_trades_{SYMBOL}.csv", index=False)
     summary_df.to_csv(f"results/backtest_summary_{SYMBOL}.csv", index=False)
-    save_markdown(summary_df, f"results/backtest_summary_{SYMBOL}.md")
+    report_df.to_csv(f"results/backtest_report_{SYMBOL}.csv", index=False)
+
+    save_markdown_summary(summary_df, f"results/backtest_summary_{SYMBOL}.md")
+    save_markdown_report(report_df, f"results/backtest_report_{SYMBOL}.md")
 
 
 if __name__ == "__main__":
     main()
-    
