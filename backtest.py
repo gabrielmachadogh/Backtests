@@ -8,13 +8,13 @@ BASE_URL = os.getenv("MEXC_CONTRACT_BASE_URL", "https://contract.mexc.com/api/v1
 SYMBOL = os.getenv("SYMBOL", "BTC_USDT")
 
 TIMEFRAMES = [x.strip().lower() for x in os.getenv("TIMEFRAMES", "1h,2h,4h,1d,1w").split(",") if x.strip()]
-SETUPS = [x.strip().upper() for x in os.getenv("SETUPS", "PFR,DL,IB").split(",") if x.strip()]
+SETUPS = [x.strip().upper() for x in os.getenv("SETUPS", "PFR,DL").split(",") if x.strip()]
 
 # Médias fixas
 SMA_SHORT = int(os.getenv("SMA_SHORT", "8"))
 SMA_LONG = int(os.getenv("SMA_LONG", "80"))
 
-# Inclinação: SMA curta atual acima/abaixo dos últimos N (N=8)
+# Inclinação: SMA curta acima/abaixo dos últimos N (N=8)
 SLOPE_LOOKBACK = int(os.getenv("SLOPE_LOOKBACK", "8"))
 
 # ATR
@@ -25,7 +25,7 @@ RRS = [float(x) for x in os.getenv("RRS", "1,1.5,2").split(",")]
 
 # Execução
 AMBIGUOUS_POLICY = os.getenv("AMBIGUOUS_POLICY", "loss").lower()  # loss|win|skip
-MAX_ENTRY_WAIT_BARS = int(os.getenv("MAX_ENTRY_WAIT_BARS", "4"))   # para ter fill_delay 1..4
+MAX_ENTRY_WAIT_BARS = int(os.getenv("MAX_ENTRY_WAIT_BARS", "1"))   # solicitado: 1
 MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "50"))
 
 # Histórico
@@ -34,6 +34,9 @@ WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", "30"))
 
 # Tick size
 TICK_SIZE = float(os.getenv("TICK_SIZE", "0"))
+
+# Buckets low para slope_strength
+LOW_PCTS = [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60]
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
@@ -220,6 +223,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     x["slope_up"] = x["sma_s"] > prev_max
     x["slope_down"] = x["sma_s"] < prev_min
 
+    # sempre positivo (magnitude) para comparar
     x["slope_strength_up"] = x["sma_s"] - prev_max
     x["slope_strength_down"] = prev_min - x["sma_s"]
 
@@ -238,7 +242,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return x
 
 
-# -------------------- setups --------------------
+# -------------------- setups (apenas PFR e DL) --------------------
 def pfr_buy_signal(x: pd.DataFrame, i: int) -> bool:
     return (
         (x.loc[i, "low"] < x.loc[i - 1, "low"])
@@ -263,34 +267,18 @@ def dl_sell_signal(x: pd.DataFrame, i: int) -> bool:
     return (x.loc[i, "high"] > x.loc[i - 1, "high"]) and (x.loc[i, "high"] > x.loc[i - 2, "high"])
 
 
-def ib_signal_filtered(x: pd.DataFrame, i: int) -> bool:
-    inside = (x.loc[i, "high"] <= x.loc[i - 1, "high"]) and (x.loc[i, "low"] >= x.loc[i - 1, "low"])
-    if not inside:
-        return False
-
-    r_i = float(x.loc[i, "high"] - x.loc[i, "low"])
-    r_prev = float(x.loc[i - 1, "high"] - x.loc[i - 1, "low"])
-    if r_prev <= 0:
-        return False
-
-    return r_i <= 0.5 * r_prev
-
-
 # -------------------- execução / fill / TP/SL --------------------
-def find_fill_long(x: pd.DataFrame, entry_price: float, start_idx: int, max_wait: int):
-    end = min(start_idx + max_wait, len(x))
-    for j in range(start_idx, end):
-        if float(x.loc[j, "high"]) >= entry_price:
-            return j
-    return None
+def find_fill_long(x: pd.DataFrame, entry_price: float, start_idx: int):
+    # como MAX_ENTRY_WAIT_BARS=1, só confere o próximo candle
+    if start_idx >= len(x):
+        return None
+    return start_idx if float(x.loc[start_idx, "high"]) >= entry_price else None
 
 
-def find_fill_short(x: pd.DataFrame, entry_price: float, start_idx: int, max_wait: int):
-    end = min(start_idx + max_wait, len(x))
-    for j in range(start_idx, end):
-        if float(x.loc[j, "low"]) <= entry_price:
-            return j
-    return None
+def find_fill_short(x: pd.DataFrame, entry_price: float, start_idx: int):
+    if start_idx >= len(x):
+        return None
+    return start_idx if float(x.loc[start_idx, "low"]) <= entry_price else None
 
 
 def simulate_tp_sl(x: pd.DataFrame, entry_idx: int, side: str, entry_price: float, stop_price: float, rr: float):
@@ -308,7 +296,6 @@ def simulate_tp_sl(x: pd.DataFrame, entry_idx: int, side: str, entry_price: floa
             l = float(x.loc[j, "low"])
             hit_tp = h >= tp
             hit_sl = l <= sl
-
             if hit_tp and hit_sl:
                 if AMBIGUOUS_POLICY == "skip":
                     return "skip"
@@ -331,7 +318,6 @@ def simulate_tp_sl(x: pd.DataFrame, entry_idx: int, side: str, entry_price: floa
             l = float(x.loc[j, "low"])
             hit_tp = l <= tp
             hit_sl = h >= sl
-
             if hit_tp and hit_sl:
                 if AMBIGUOUS_POLICY == "skip":
                     return "skip"
@@ -356,18 +342,18 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
         if side == "long":
             entry_price = float(x.loc[i, "high"]) + tick
             stop_price = float(x.loc[i, "low"]) - tick
-            fill_idx = find_fill_long(x, entry_price, i + 1, MAX_ENTRY_WAIT_BARS)
+            fill_idx = find_fill_long(x, entry_price, i + 1)
             slope_strength = float(x.loc[i, "slope_strength_up"]) if pd.notna(x.loc[i, "slope_strength_up"]) else np.nan
         else:
             entry_price = float(x.loc[i, "low"]) - tick
             stop_price = float(x.loc[i, "high"]) + tick
-            fill_idx = find_fill_short(x, entry_price, i + 1, MAX_ENTRY_WAIT_BARS)
+            fill_idx = find_fill_short(x, entry_price, i + 1)
             slope_strength = float(x.loc[i, "slope_strength_down"]) if pd.notna(x.loc[i, "slope_strength_down"]) else np.nan
 
         if fill_idx is None:
             return
 
-        fill_delay = int(fill_idx - i)  # 1..MAX_ENTRY_WAIT_BARS
+        fill_delay = int(fill_idx - i)  # sempre 1 com este modelo
 
         row = {
             "timeframe": tf_name,
@@ -396,7 +382,7 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
     for i in range(start, len(x) - 1):
         if pd.isna(x.loc[i, "sma_s"]) or pd.isna(x.loc[i, "sma_l"]) or pd.isna(x.loc[i, "atr_pct"]):
             continue
-        if pd.isna(x.loc[i, "ma_gap_pct"]) or pd.isna(x.loc[i, "dist_to_sma80_pct"]) or pd.isna(x.loc[i, "clv"]):
+        if pd.isna(x.loc[i, "slope_strength_up"]) and pd.isna(x.loc[i, "slope_strength_down"]):
             continue
 
         trend_up = bool(x.loc[i, "trend_up"])
@@ -409,22 +395,18 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
                 add_trade(i, "PFR", "long")
             if "DL" in SETUPS and dl_buy_signal(x, i):
                 add_trade(i, "DL", "long")
-            if "IB" in SETUPS and ib_signal_filtered(x, i):
-                add_trade(i, "IB", "long")
 
         if trend_down and slope_down:
             if "PFR" in SETUPS and pfr_sell_signal(x, i):
                 add_trade(i, "PFR", "short")
             if "DL" in SETUPS and dl_sell_signal(x, i):
                 add_trade(i, "DL", "short")
-            if "IB" in SETUPS and ib_signal_filtered(x, i):
-                add_trade(i, "IB", "short")
 
     return pd.DataFrame(rows)
 
 
-def summarize(trades: pd.DataFrame) -> pd.DataFrame:
-    cols = ["timeframe", "setup", "rr", "trades", "wins", "losses", "no_hit", "skipped", "win_rate", "win_rate_pct"]
+def summarize(trades: pd.DataFrame, slope_filter: str = "ALL") -> pd.DataFrame:
+    cols = ["slope_filter", "timeframe", "setup", "rr", "trades", "wins", "losses", "no_hit", "skipped", "win_rate", "win_rate_pct"]
     if trades.empty:
         return pd.DataFrame(columns=cols)
 
@@ -445,6 +427,7 @@ def summarize(trades: pd.DataFrame) -> pd.DataFrame:
                 win_rate = (wins / denom) if denom > 0 else np.nan
 
                 summaries.append({
+                    "slope_filter": slope_filter,
                     "timeframe": tf,
                     "setup": setup,
                     "rr": rr,
@@ -460,106 +443,25 @@ def summarize(trades: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(summaries, columns=cols)
 
 
-def melt_outcomes(trades: pd.DataFrame) -> pd.DataFrame:
+def apply_slope_low_filter(trades: pd.DataFrame, p: float) -> pd.DataFrame:
+    """
+    Mantém apenas trades no LOW p% de slope_strength, calculando quantil por (timeframe, setup).
+    """
     if trades.empty:
-        return pd.DataFrame(columns=["timeframe", "setup", "rr", "outcome", "slope_strength", "fill_delay"])
-    rr_cols = [f"rr_{rr}" for rr in RRS]
-    base_cols = ["timeframe", "setup", "slope_strength", "fill_delay"]
-    long_df = trades[base_cols + rr_cols].copy()
-    long_df = long_df.melt(
-        id_vars=base_cols,
-        value_vars=rr_cols,
-        var_name="rr_col",
-        value_name="outcome",
-    )
-    long_df["rr"] = long_df["rr_col"].str.replace("rr_", "", regex=False).astype(float)
-    return long_df.drop(columns=["rr_col"])
+        return trades
 
-
-def stats_from_subset(df: pd.DataFrame) -> dict:
-    trades_n = int(df.shape[0])
-    wins = int((df["outcome"] == "win").sum())
-    losses = int((df["outcome"] == "loss").sum())
-    denom = wins + losses
-    win_rate = (wins / denom) if denom > 0 else np.nan
-    return {
-        "trades": trades_n,
-        "wins": wins,
-        "losses": losses,
-        "win_rate": win_rate,
-        "win_rate_pct": fmt_pct(win_rate),
-    }
-
-
-def report_slope_buckets(trades: pd.DataFrame) -> pd.DataFrame:
-    """
-    Buckets:
-      ALL,
-      top10, top15, top20, top25, top30,
-      low10, low15, low20, low25, low30
-    """
-    cols = ["timeframe", "setup", "rr", "bucket", "trades", "wins", "losses", "win_rate", "win_rate_pct"]
-    long_df = melt_outcomes(trades)
-    if long_df.empty:
-        return pd.DataFrame(columns=cols)
-
-    long_df = long_df.dropna(subset=["slope_strength"])
-
-    ps = [0.10, 0.15, 0.20, 0.25, 0.30]
-    out_rows = []
-
-    for (tf, setup, rr), g in long_df.groupby(["timeframe", "setup", "rr"]):
-        # ALL
-        base = {"timeframe": tf, "setup": setup, "rr": rr, "bucket": "ALL"}
-        base.update(stats_from_subset(g))
-        out_rows.append(base)
-
-        if g.shape[0] == 0:
+    out_parts = []
+    for (tf, setup), g in trades.groupby(["timeframe", "setup"], dropna=False):
+        g2 = g.dropna(subset=["slope_strength"]).copy()
+        if g2.empty:
             continue
+        q = g2["slope_strength"].quantile(p)
+        out_parts.append(g2[g2["slope_strength"] <= q])
 
-        for p in ps:
-            q_hi = g["slope_strength"].quantile(1.0 - p)
-            q_lo = g["slope_strength"].quantile(p)
+    if not out_parts:
+        return pd.DataFrame(columns=trades.columns)
 
-            g_top = g[g["slope_strength"] >= q_hi]
-            g_low = g[g["slope_strength"] <= q_lo]
-
-            row_top = {"timeframe": tf, "setup": setup, "rr": rr, "bucket": f"top{int(p*100)}"}
-            row_top.update(stats_from_subset(g_top))
-            out_rows.append(row_top)
-
-            row_low = {"timeframe": tf, "setup": setup, "rr": rr, "bucket": f"low{int(p*100)}"}
-            row_low.update(stats_from_subset(g_low))
-            out_rows.append(row_low)
-
-    return pd.DataFrame(out_rows, columns=cols)
-
-
-def report_fill_delay(trades: pd.DataFrame) -> pd.DataFrame:
-    """
-    Buckets:
-      ALL, 1, 2, 3, 4
-    """
-    cols = ["timeframe", "setup", "rr", "bucket", "trades", "wins", "losses", "win_rate", "win_rate_pct"]
-    long_df = melt_outcomes(trades)
-    if long_df.empty:
-        return pd.DataFrame(columns=cols)
-
-    out_rows = []
-    delays = [1, 2, 3, 4]
-
-    for (tf, setup, rr), g in long_df.groupby(["timeframe", "setup", "rr"]):
-        base = {"timeframe": tf, "setup": setup, "rr": rr, "bucket": "ALL"}
-        base.update(stats_from_subset(g))
-        out_rows.append(base)
-
-        for d in delays:
-            gd = g[g["fill_delay"] == d]
-            row = {"timeframe": tf, "setup": setup, "rr": rr, "bucket": str(d)}
-            row.update(stats_from_subset(gd))
-            out_rows.append(row)
-
-    return pd.DataFrame(out_rows, columns=cols)
+    return pd.concat(out_parts, ignore_index=True)
 
 
 def save_markdown_table(df: pd.DataFrame, title: str, path: str):
@@ -568,41 +470,21 @@ def save_markdown_table(df: pd.DataFrame, title: str, path: str):
         if df.empty:
             f.write("Sem dados.\n")
             return
-        f.write("| TF | Setup | RR | Bucket | Trades | Wins | Losses | WinRate |\n")
-        f.write("|---|---|---:|---|---:|---:|---:|---:|\n")
+        f.write("| SlopeFilter | TF | Setup | RR | Trades | Wins | Losses | WinRate |\n")
+        f.write("|---|---|---|---:|---:|---:|---:|---:|\n")
         for _, r in df.iterrows():
             f.write(
-                f"| {r['timeframe']} | {r['setup']} | {r['rr']} | {r['bucket']} | {int(r['trades'])} | {int(r['wins'])} | {int(r['losses'])} | {r.get('win_rate_pct','-')} |\n"
-            )
-
-
-def save_markdown_summary(summary_df: pd.DataFrame, path: str):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"# Summary — {SYMBOL}\n\n")
-        f.write(f"- Gerado em UTC: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}\n")
-        f.write(f"- Timeframes: `{', '.join(TIMEFRAMES)}`\n")
-        f.write(f"- Médias: SMA{SMA_SHORT}/SMA{SMA_LONG}\n")
-        f.write(f"- Inclinação: SMA{SMA_SHORT} acima/abaixo dos últimos {SLOPE_LOOKBACK}\n")
-        f.write(f"- Inside Bar: range <= 50% do candle anterior\n")
-        f.write(f"- Fill max: {MAX_ENTRY_WAIT_BARS} candles\n")
-        f.write(f"- ATR: {ATR_PERIOD}\n")
-        f.write(f"- Setups: `{', '.join(SETUPS)}`\n")
-        f.write(f"- RRs: `{', '.join([str(r) for r in RRS])}`\n\n")
-
-        if summary_df.empty:
-            f.write("Sem resultados.\n")
-            return
-
-        f.write("| TF | Setup | RR | Trades | Wins | Losses | NoHit | Skipped | WinRate |\n")
-        f.write("|---|---|---:|---:|---:|---:|---:|---:|---:|\n")
-        for _, r in summary_df.iterrows():
-            f.write(
-                f"| {r['timeframe']} | {r['setup']} | {r['rr']} | {int(r['trades'])} | {int(r['wins'])} | {int(r['losses'])} | {int(r['no_hit'])} | {int(r['skipped'])} | {r.get('win_rate_pct','-')} |\n"
+                f"| {r['slope_filter']} | {r['timeframe']} | {r['setup']} | {r['rr']} | {int(r['trades'])} | {int(r['wins'])} | {int(r['losses'])} | {r.get('win_rate_pct','-')} |\n"
             )
 
 
 def main():
     os.makedirs("results", exist_ok=True)
+
+    if DEBUG:
+        print("[debug] CONFIG:",
+              SYMBOL, TIMEFRAMES, SETUPS, SMA_SHORT, SMA_LONG, SLOPE_LOOKBACK,
+              ATR_PERIOD, RRS, MAX_ENTRY_WAIT_BARS, MAX_HOLD_BARS)
 
     df_1h = fetch_ohlcv_1h_max(SYMBOL, max_bars=MAX_BARS_1H, window_days=WINDOW_DAYS)
     if df_1h.empty:
@@ -632,21 +514,23 @@ def main():
 
     trades_df = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
 
-    # salvar trades SEMPRE
+    # 1) salvar trades SEMPRE
     trades_path = f"results/backtest_trades_{SYMBOL}.csv"
     trades_df.to_csv(trades_path, index=False)
 
-    summary_df = summarize(trades_df)
+    # 2) summary ALL + slope low buckets
+    summaries = []
+    summaries.append(summarize(trades_df, slope_filter="ALL"))
+
+    for p in LOW_PCTS:
+        label = f"low{int(p*100)}"
+        fdf = apply_slope_low_filter(trades_df, p)
+        summaries.append(summarize(fdf, slope_filter=label))
+
+    summary_df = pd.concat(summaries, ignore_index=True) if summaries else pd.DataFrame()
+
     summary_df.to_csv(f"results/backtest_summary_{SYMBOL}.csv", index=False)
-    save_markdown_summary(summary_df, f"results/backtest_summary_{SYMBOL}.md")
-
-    slope_report = report_slope_buckets(trades_df)
-    slope_report.to_csv(f"results/backtest_report_slope_{SYMBOL}.csv", index=False)
-    save_markdown_table(slope_report, f"Report — slope_strength buckets — {SYMBOL}", f"results/backtest_report_slope_{SYMBOL}.md")
-
-    fill_report = report_fill_delay(trades_df)
-    fill_report.to_csv(f"results/backtest_report_fill_delay_{SYMBOL}.csv", index=False)
-    save_markdown_table(fill_report, f"Report — fill_delay buckets — {SYMBOL}", f"results/backtest_report_fill_delay_{SYMBOL}.md")
+    save_markdown_table(summary_df, f"Summary (ALL + slope low buckets) — {SYMBOL}", f"results/backtest_summary_{SYMBOL}.md")
 
 
 if __name__ == "__main__":
