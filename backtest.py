@@ -14,18 +14,20 @@ SETUPS = [x.strip().upper() for x in os.getenv("SETUPS", "PFR,DL").split(",") if
 SMA_SHORT = int(os.getenv("SMA_SHORT", "8"))
 SMA_LONG = int(os.getenv("SMA_LONG", "80"))
 
-# Inclinação: SMA curta acima/abaixo dos últimos N (N=8)
+# Inclinação (sua regra: SMA curta acima/abaixo dos últimos N)
 SLOPE_LOOKBACK = int(os.getenv("SLOPE_LOOKBACK", "8"))
 
-# ATR
+# ATR / RSI / janelas auxiliares
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
+LOOKBACK_N = int(os.getenv("LOOKBACK_N", "20"))  # para high/low range, vol_z, etc.
 
 # RRs
 RRS = [float(x) for x in os.getenv("RRS", "1,1.5,2").split(",")]
 
 # Execução
 AMBIGUOUS_POLICY = os.getenv("AMBIGUOUS_POLICY", "loss").lower()  # loss|win|skip
-MAX_ENTRY_WAIT_BARS = int(os.getenv("MAX_ENTRY_WAIT_BARS", "1"))   # solicitado: 1
+MAX_ENTRY_WAIT_BARS = int(os.getenv("MAX_ENTRY_WAIT_BARS", "1"))   # solicitado
 MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "50"))
 
 # Histórico
@@ -35,33 +37,9 @@ WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", "30"))
 # Tick size
 TICK_SIZE = float(os.getenv("TICK_SIZE", "0"))
 
-# Buckets low para slope_strength
-LOW_PCTS = [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60]
-
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
 
-def fmt_pct(win_rate) -> str:
-    """Formata taxa de acerto como 43,2% (máx 3 dígitos antes do %)."""
-    try:
-        if win_rate is None:
-            return "-"
-        if isinstance(win_rate, (float, np.floating)) and np.isnan(win_rate):
-            return "-"
-        pct = float(win_rate) * 100.0
-    except Exception:
-        return "-"
-
-    if pct >= 100:
-        return "100%"
-
-    s = f"{pct:.1f}".replace(".", ",")
-    if s.endswith(",0"):
-        s = s[:-2]
-    return f"{s}%"
-
-
-# -------------------- infra / parsing --------------------
 def http_get_json(url, params=None, tries=3, timeout=25):
     last = None
     for i in range(tries):
@@ -208,41 +186,85 @@ def add_atr(df: pd.DataFrame, period: int) -> pd.DataFrame:
     return x
 
 
-# -------------------- indicadores e filtros --------------------
+def add_rsi(df: pd.DataFrame, period: int) -> pd.DataFrame:
+    x = df.copy()
+    delta = x["close"].diff()
+    up = delta.clip(lower=0.0)
+    down = (-delta).clip(lower=0.0)
+    roll_up = up.rolling(period).mean()
+    roll_down = down.rolling(period).mean()
+    rs = roll_up / roll_down.replace(0, np.nan)
+    x["rsi"] = 100.0 - (100.0 / (1.0 + rs))
+    return x
+
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
+
+    # MAs
     x["sma_s"] = sma(x["close"], SMA_SHORT)
     x["sma_l"] = sma(x["close"], SMA_LONG)
 
+    # tendência
     x["trend_up"] = ((x["close"] > x["sma_s"]) & (x["close"] > x["sma_l"]) & (x["sma_s"] > x["sma_l"]))
     x["trend_down"] = ((x["close"] < x["sma_s"]) & (x["close"] < x["sma_l"]) & (x["sma_s"] < x["sma_l"]))
 
+    # inclinação: acima/abaixo do último N (máximo/mínimo)
     prev_max = x["sma_s"].shift(1).rolling(SLOPE_LOOKBACK).max()
     prev_min = x["sma_s"].shift(1).rolling(SLOPE_LOOKBACK).min()
-
     x["slope_up"] = x["sma_s"] > prev_max
     x["slope_down"] = x["sma_s"] < prev_min
-
-    # sempre positivo (magnitude) para comparar
     x["slope_strength_up"] = x["sma_s"] - prev_max
     x["slope_strength_down"] = prev_min - x["sma_s"]
 
-    x["ma_gap_pct"] = (x["sma_s"] - x["sma_l"]) / x["sma_l"] * 100.0
-    x["dist_to_sma80_pct"] = (x["close"] - x["sma_l"]) / x["sma_l"] * 100.0
-
+    # ATR + ATR%
     x = add_atr(x, ATR_PERIOD)
     x["atr_pct"] = (x["atr"] / x["close"]) * 100.0
 
-    x["range"] = (x["high"] - x["low"])
-    x["range_pct"] = (x["range"] / x["close"]) * 100.0
+    # RSI
+    x = add_rsi(x, RSI_PERIOD)
 
-    denom = (x["high"] - x["low"]).replace(0, np.nan)
+    # Returns / momentum
+    x["ret_1_pct"] = x["close"].pct_change(1) * 100.0
+    x["ret_3_pct"] = x["close"].pct_change(3) * 100.0
+    x["ret_5_pct"] = x["close"].pct_change(5) * 100.0
+
+    # Range / body / wicks
+    x["range"] = x["high"] - x["low"]
+    x["range_pct"] = (x["range"] / x["close"]) * 100.0
+    x["body"] = (x["close"] - x["open"]).abs()
+    x["body_pct"] = (x["body"] / x["range"].replace(0, np.nan)) * 100.0
+
+    x["upper_wick"] = x["high"] - np.maximum(x["open"], x["close"])
+    x["lower_wick"] = np.minimum(x["open"], x["close"]) - x["low"]
+    x["upper_wick_pct"] = (x["upper_wick"] / x["range"].replace(0, np.nan)) * 100.0
+    x["lower_wick_pct"] = (x["lower_wick"] / x["range"].replace(0, np.nan)) * 100.0
+
+    # CLV (close location)
+    denom = x["range"].replace(0, np.nan)
     x["clv"] = (x["close"] - x["low"]) / denom
+
+    # Distâncias e gaps
+    x["ma_gap_pct"] = (x["sma_s"] - x["sma_l"]) / x["sma_l"] * 100.0
+    x["dist_to_sma80_pct"] = (x["close"] - x["sma_l"]) / x["sma_l"] * 100.0
+
+    # Posição no range dos últimos N candles
+    roll_hi = x["high"].rolling(LOOKBACK_N).max()
+    roll_lo = x["low"].rolling(LOOKBACK_N).min()
+    x["pos_in_range_n"] = (x["close"] - roll_lo) / (roll_hi - roll_lo).replace(0, np.nan)
+
+    x["dist_to_high_n_pct"] = (roll_hi - x["close"]) / x["close"] * 100.0
+    x["dist_to_low_n_pct"] = (x["close"] - roll_lo) / x["close"] * 100.0
+
+    # Volume zscore
+    vol_mean = x["volume"].rolling(LOOKBACK_N).mean()
+    vol_std = x["volume"].rolling(LOOKBACK_N).std().replace(0, np.nan)
+    x["vol_z"] = (x["volume"] - vol_mean) / vol_std
 
     return x
 
 
-# -------------------- setups (apenas PFR e DL) --------------------
+# -------------------- setups (PFR + DL) --------------------
 def pfr_buy_signal(x: pd.DataFrame, i: int) -> bool:
     return (
         (x.loc[i, "low"] < x.loc[i - 1, "low"])
@@ -268,17 +290,20 @@ def dl_sell_signal(x: pd.DataFrame, i: int) -> bool:
 
 
 # -------------------- execução / fill / TP/SL --------------------
-def find_fill_long(x: pd.DataFrame, entry_price: float, start_idx: int):
-    # como MAX_ENTRY_WAIT_BARS=1, só confere o próximo candle
-    if start_idx >= len(x):
-        return None
-    return start_idx if float(x.loc[start_idx, "high"]) >= entry_price else None
+def find_fill_long(x: pd.DataFrame, entry_price: float, start_idx: int, max_wait: int):
+    end = min(start_idx + max_wait, len(x))
+    for j in range(start_idx, end):
+        if float(x.loc[j, "high"]) >= entry_price:
+            return j
+    return None
 
 
-def find_fill_short(x: pd.DataFrame, entry_price: float, start_idx: int):
-    if start_idx >= len(x):
-        return None
-    return start_idx if float(x.loc[start_idx, "low"]) <= entry_price else None
+def find_fill_short(x: pd.DataFrame, entry_price: float, start_idx: int, max_wait: int):
+    end = min(start_idx + max_wait, len(x))
+    for j in range(start_idx, end):
+        if float(x.loc[j, "low"]) <= entry_price:
+            return j
+    return None
 
 
 def simulate_tp_sl(x: pd.DataFrame, entry_idx: int, side: str, entry_price: float, stop_price: float, rr: float):
@@ -335,25 +360,41 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
     x = add_indicators(df).reset_index(drop=True)
     tick = TICK_SIZE if TICK_SIZE > 0 else infer_tick_size_from_prices(x["close"])
 
-    start = max(SMA_LONG + SLOPE_LOOKBACK + ATR_PERIOD + 20, 5)
+    start = max(SMA_LONG + SLOPE_LOOKBACK + ATR_PERIOD + RSI_PERIOD + LOOKBACK_N + 10, 10)
     rows = []
+
+    def snapshot_features(i: int, side: str) -> dict:
+        # slope_strength unificado (positivo)
+        if side == "long":
+            slope_strength = x.loc[i, "slope_strength_up"]
+        else:
+            slope_strength = x.loc[i, "slope_strength_down"]
+
+        keys = [
+            "ma_gap_pct", "dist_to_sma80_pct", "atr_pct", "clv", "range_pct",
+            "body_pct", "upper_wick_pct", "lower_wick_pct",
+            "ret_1_pct", "ret_3_pct", "ret_5_pct",
+            "rsi", "pos_in_range_n",
+            "dist_to_high_n_pct", "dist_to_low_n_pct",
+            "vol_z",
+        ]
+        out = {"slope_strength": float(slope_strength) if pd.notna(slope_strength) else np.nan}
+        for k in keys:
+            out[k] = float(x.loc[i, k]) if (k in x.columns and pd.notna(x.loc[i, k])) else np.nan
+        return out
 
     def add_trade(i: int, setup_name: str, side: str):
         if side == "long":
             entry_price = float(x.loc[i, "high"]) + tick
             stop_price = float(x.loc[i, "low"]) - tick
-            fill_idx = find_fill_long(x, entry_price, i + 1)
-            slope_strength = float(x.loc[i, "slope_strength_up"]) if pd.notna(x.loc[i, "slope_strength_up"]) else np.nan
+            fill_idx = find_fill_long(x, entry_price, i + 1, MAX_ENTRY_WAIT_BARS)
         else:
             entry_price = float(x.loc[i, "low"]) - tick
             stop_price = float(x.loc[i, "high"]) + tick
-            fill_idx = find_fill_short(x, entry_price, i + 1)
-            slope_strength = float(x.loc[i, "slope_strength_down"]) if pd.notna(x.loc[i, "slope_strength_down"]) else np.nan
+            fill_idx = find_fill_short(x, entry_price, i + 1, MAX_ENTRY_WAIT_BARS)
 
         if fill_idx is None:
             return
-
-        fill_delay = int(fill_idx - i)  # sempre 1 com este modelo
 
         row = {
             "timeframe": tf_name,
@@ -361,18 +402,11 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
             "side": side,
             "signal_time": x.loc[i, "ts"],
             "entry_time": x.loc[fill_idx, "ts"],
-            "fill_delay": fill_delay,
+            "fill_delay": int(fill_idx - i),
             "entry_price": entry_price,
             "stop_price": stop_price,
-
-            # features do candle do sinal:
-            "ma_gap_pct": float(x.loc[i, "ma_gap_pct"]) if pd.notna(x.loc[i, "ma_gap_pct"]) else np.nan,
-            "dist_to_sma80_pct": float(x.loc[i, "dist_to_sma80_pct"]) if pd.notna(x.loc[i, "dist_to_sma80_pct"]) else np.nan,
-            "atr_pct": float(x.loc[i, "atr_pct"]) if pd.notna(x.loc[i, "atr_pct"]) else np.nan,
-            "clv": float(x.loc[i, "clv"]) if pd.notna(x.loc[i, "clv"]) else np.nan,
-            "range_pct": float(x.loc[i, "range_pct"]) if pd.notna(x.loc[i, "range_pct"]) else np.nan,
-            "slope_strength": slope_strength,
         }
+        row.update(snapshot_features(i, side))
 
         for rr in RRS:
             row[f"rr_{rr}"] = simulate_tp_sl(x, fill_idx, side, entry_price, stop_price, rr)
@@ -380,9 +414,8 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
         rows.append(row)
 
     for i in range(start, len(x) - 1):
-        if pd.isna(x.loc[i, "sma_s"]) or pd.isna(x.loc[i, "sma_l"]) or pd.isna(x.loc[i, "atr_pct"]):
-            continue
-        if pd.isna(x.loc[i, "slope_strength_up"]) and pd.isna(x.loc[i, "slope_strength_down"]):
+        # NaNs básicos
+        if pd.isna(x.loc[i, "sma_s"]) or pd.isna(x.loc[i, "sma_l"]):
             continue
 
         trend_up = bool(x.loc[i, "trend_up"])
@@ -390,12 +423,14 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
         slope_up = bool(x.loc[i, "slope_up"])
         slope_down = bool(x.loc[i, "slope_down"])
 
+        # compra
         if trend_up and slope_up:
             if "PFR" in SETUPS and pfr_buy_signal(x, i):
                 add_trade(i, "PFR", "long")
             if "DL" in SETUPS and dl_buy_signal(x, i):
                 add_trade(i, "DL", "long")
 
+        # venda
         if trend_down and slope_down:
             if "PFR" in SETUPS and pfr_sell_signal(x, i):
                 add_trade(i, "PFR", "short")
@@ -405,86 +440,71 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def summarize(trades: pd.DataFrame, slope_filter: str = "ALL") -> pd.DataFrame:
-    cols = ["slope_filter", "timeframe", "setup", "rr", "trades", "wins", "losses", "no_hit", "skipped", "win_rate", "win_rate_pct"]
+def fmt_pct(win_rate):
+    try:
+        if win_rate is None or (isinstance(win_rate, float) and np.isnan(win_rate)):
+            return "-"
+        pct = float(win_rate) * 100.0
+        if pct >= 100:
+            return "100%"
+        s = f"{pct:.1f}".replace(".", ",")
+        if s.endswith(",0"):
+            s = s[:-2]
+        return f"{s}%"
+    except Exception:
+        return "-"
+
+
+def summarize(trades: pd.DataFrame) -> pd.DataFrame:
+    cols = ["timeframe", "setup", "rr", "trades", "wins", "losses", "no_hit", "skipped", "win_rate", "win_rate_pct"]
     if trades.empty:
         return pd.DataFrame(columns=cols)
 
-    summaries = []
+    rows = []
     for tf in sorted(trades["timeframe"].unique()):
         rtf = trades[trades["timeframe"] == tf]
         for setup in sorted(rtf["setup"].unique()):
             rs = rtf[rtf["setup"] == setup]
             for rr in RRS:
-                col = f"rr_{rr}"
-                wins = int((rs[col] == "win").sum())
-                losses = int((rs[col] == "loss").sum())
-                no_hit = int((rs[col] == "no_hit").sum())
-                skipped = int((rs[col] == "skip").sum())
+                c = f"rr_{rr}"
+                wins = int((rs[c] == "win").sum())
+                losses = int((rs[c] == "loss").sum())
+                no_hit = int((rs[c] == "no_hit").sum())
+                skipped = int((rs[c] == "skip").sum())
                 trades_n = wins + losses + no_hit + skipped
-
                 denom = wins + losses
                 win_rate = (wins / denom) if denom > 0 else np.nan
-
-                summaries.append({
-                    "slope_filter": slope_filter,
-                    "timeframe": tf,
-                    "setup": setup,
-                    "rr": rr,
-                    "trades": trades_n,
-                    "wins": wins,
-                    "losses": losses,
-                    "no_hit": no_hit,
-                    "skipped": skipped,
-                    "win_rate": win_rate,
-                    "win_rate_pct": fmt_pct(win_rate),
+                rows.append({
+                    "timeframe": tf, "setup": setup, "rr": rr,
+                    "trades": trades_n, "wins": wins, "losses": losses,
+                    "no_hit": no_hit, "skipped": skipped,
+                    "win_rate": win_rate, "win_rate_pct": fmt_pct(win_rate),
                 })
-
-    return pd.DataFrame(summaries, columns=cols)
-
-
-def apply_slope_low_filter(trades: pd.DataFrame, p: float) -> pd.DataFrame:
-    """
-    Mantém apenas trades no LOW p% de slope_strength, calculando quantil por (timeframe, setup).
-    """
-    if trades.empty:
-        return trades
-
-    out_parts = []
-    for (tf, setup), g in trades.groupby(["timeframe", "setup"], dropna=False):
-        g2 = g.dropna(subset=["slope_strength"]).copy()
-        if g2.empty:
-            continue
-        q = g2["slope_strength"].quantile(p)
-        out_parts.append(g2[g2["slope_strength"] <= q])
-
-    if not out_parts:
-        return pd.DataFrame(columns=trades.columns)
-
-    return pd.concat(out_parts, ignore_index=True)
+    return pd.DataFrame(rows, columns=cols)
 
 
-def save_markdown_table(df: pd.DataFrame, title: str, path: str):
+def save_md_summary(summary_df: pd.DataFrame, path: str):
     with open(path, "w", encoding="utf-8") as f:
-        f.write(f"# {title}\n\n")
-        if df.empty:
+        f.write(f"# Summary — {SYMBOL}\n\n")
+        f.write(f"- Gerado em UTC: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}\n")
+        f.write(f"- Timeframes: `{', '.join(TIMEFRAMES)}`\n")
+        f.write(f"- Setups: `{', '.join(SETUPS)}`\n")
+        f.write(f"- SMA: {SMA_SHORT}/{SMA_LONG} | slope lookback: {SLOPE_LOOKBACK}\n")
+        f.write(f"- MAX_ENTRY_WAIT_BARS: {MAX_ENTRY_WAIT_BARS}\n")
+        f.write(f"- RRs: {RRS}\n\n")
+
+        if summary_df.empty:
             f.write("Sem dados.\n")
             return
-        f.write("| SlopeFilter | TF | Setup | RR | Trades | Wins | Losses | WinRate |\n")
-        f.write("|---|---|---|---:|---:|---:|---:|---:|\n")
-        for _, r in df.iterrows():
-            f.write(
-                f"| {r['slope_filter']} | {r['timeframe']} | {r['setup']} | {r['rr']} | {int(r['trades'])} | {int(r['wins'])} | {int(r['losses'])} | {r.get('win_rate_pct','-')} |\n"
-            )
+
+        f.write("| TF | Setup | RR | Trades | Wins | Losses | WinRate |\n")
+        f.write("|---|---|---:|---:|---:|---:|---:|\n")
+        for _, r in summary_df.iterrows():
+            f.write(f"| {r['timeframe']} | {r['setup']} | {r['rr']} | {int(r['trades'])} | {int(r['wins'])} | {int(r['losses'])} | {r['win_rate_pct']} |\n")
 
 
 def main():
     os.makedirs("results", exist_ok=True)
-
-    if DEBUG:
-        print("[debug] CONFIG:",
-              SYMBOL, TIMEFRAMES, SETUPS, SMA_SHORT, SMA_LONG, SLOPE_LOOKBACK,
-              ATR_PERIOD, RRS, MAX_ENTRY_WAIT_BARS, MAX_HOLD_BARS)
 
     df_1h = fetch_ohlcv_1h_max(SYMBOL, max_bars=MAX_BARS_1H, window_days=WINDOW_DAYS)
     if df_1h.empty:
@@ -507,30 +527,19 @@ def main():
         df_tf = tf_map.get(tf)
         if df_tf is None or df_tf.empty:
             continue
-        min_len = SMA_LONG + SLOPE_LOOKBACK + ATR_PERIOD + 50
+        min_len = SMA_LONG + SLOPE_LOOKBACK + ATR_PERIOD + RSI_PERIOD + LOOKBACK_N + 50
         if len(df_tf) < min_len:
             continue
         all_trades.append(backtest_setups(df_tf, tf))
 
     trades_df = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
 
-    # 1) salvar trades SEMPRE
-    trades_path = f"results/backtest_trades_{SYMBOL}.csv"
-    trades_df.to_csv(trades_path, index=False)
+    # sempre salvar o dataset de trades
+    trades_df.to_csv(f"results/backtest_trades_{SYMBOL}.csv", index=False)
 
-    # 2) summary ALL + slope low buckets
-    summaries = []
-    summaries.append(summarize(trades_df, slope_filter="ALL"))
-
-    for p in LOW_PCTS:
-        label = f"low{int(p*100)}"
-        fdf = apply_slope_low_filter(trades_df, p)
-        summaries.append(summarize(fdf, slope_filter=label))
-
-    summary_df = pd.concat(summaries, ignore_index=True) if summaries else pd.DataFrame()
-
+    summary_df = summarize(trades_df)
     summary_df.to_csv(f"results/backtest_summary_{SYMBOL}.csv", index=False)
-    save_markdown_table(summary_df, f"Summary (ALL + slope low buckets) — {SYMBOL}", f"results/backtest_summary_{SYMBOL}.md")
+    save_md_summary(summary_df, f"results/backtest_summary_{SYMBOL}.md")
 
 
 if __name__ == "__main__":
