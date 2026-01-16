@@ -17,16 +17,30 @@ jobs:
 
       SMA_SHORT: "8"
       SMA_LONG: "80"
-      SLOPE_PERIOD: "5"
+
+      # inclinação: acima/abaixo dos últimos 8 valores
+      SLOPE_LOOKBACK: "8"
+
+      # inside bar já está no código (<= 50% do candle anterior)
+
+      ATR_PERIOD: "14"
 
       RRS: "1,1.5,2"
       AMBIGUOUS_POLICY: loss
-      MAX_ENTRY_WAIT_BARS: "3"
+
+      # preencher até 2 candles
+      MAX_ENTRY_WAIT_BARS: "2"
       MAX_HOLD_BARS: "50"
 
+      # histórico
       MAX_BARS_1H: "20000"
       WINDOW_DAYS: "30"
+
       TICK_SIZE: "0"
+
+      # relatório buckets
+      TOP_BUCKET: "0.30"
+
       DEBUG: "0"
 
     steps:
@@ -46,15 +60,21 @@ jobs:
       - name: Run backtest
         run: python backtest.py
 
-      - name: Commit backtest summary to repo
+      - name: Commit backtest outputs to repo
         run: |
           git pull --rebase || true
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add "results/backtest_summary_${SYMBOL}.md" "results/backtest_summary_${SYMBOL}.csv" || true
-          git commit -m "update backtest summary ${SYMBOL}" || echo "no changes to commit"
+          git add \
+            "results/backtest_summary_${SYMBOL}.md" \
+            "results/backtest_summary_${SYMBOL}.csv" \
+            "results/backtest_report_${SYMBOL}.md" \
+            "results/backtest_report_${SYMBOL}.csv" \
+            || true
+
+          git commit -m "update backtest outputs ${SYMBOL}" || echo "no changes to commit"
           git push
 
       - name: Upload results (artifact)
