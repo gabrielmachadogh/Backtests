@@ -15,7 +15,7 @@ PAIRWISE_MAX_ROWS = int(os.getenv("PAIRWISE_MAX_ROWS", "50000"))      # top rows
 MIN_TRADES = int(os.getenv("MIN_TRADES", "30"))
 TOP_K_BEST = int(os.getenv("TOP_K_BEST", "20"))
 
-INPUT_PATH = f"results/backtest_trades_{SYMBOL}.csv"
+INPUT_PATH = "results/backtest_trades_{}.csv".format(SYMBOL)
 
 
 def fmt_pct(win_rate) -> str:
@@ -25,10 +25,10 @@ def fmt_pct(win_rate) -> str:
         pct = float(win_rate) * 100.0
         if pct >= 100:
             return "100%"
-        s = f"{pct:.1f}".replace(".", ",")
+        s = "{:.1f}".format(pct).replace(".", ",")
         if s.endswith(",0"):
             s = s[:-2]
-        return f"{s}%"
+        return "{}%".format(s)
     except Exception:
         return "-"
 
@@ -38,7 +38,7 @@ def safe_numeric(s: pd.Series) -> pd.Series:
 
 
 def melt_outcomes(trades: pd.DataFrame) -> pd.DataFrame:
-    rr_cols = [f"rr_{rr}" for rr in RRS]
+    rr_cols = ["rr_{}".format(rr) for rr in RRS]
 
     keep_cols = [c for c in trades.columns if c not in ["signal_time", "entry_time"]]
     df = trades[keep_cols].copy()
@@ -52,11 +52,12 @@ def melt_outcomes(trades: pd.DataFrame) -> pd.DataFrame:
     long_df["rr"] = long_df["rr_col"].str.replace("rr_", "", regex=False).astype(float)
     long_df = long_df.drop(columns=["rr_col"])
 
+    # só resolvidos para winrate
     long_df = long_df[long_df["outcome"].isin(["win", "loss"])].copy()
 
     for c in ["timeframe", "setup", "side", "rr", "outcome"]:
         if c not in long_df.columns:
-            raise RuntimeError(f"Coluna obrigatória ausente: {c}")
+            raise RuntimeError("Coluna obrigatória ausente: {}".format(c))
 
     return long_df
 
@@ -121,29 +122,38 @@ def univariate_report(long_df: pd.DataFrame, features: list[str]) -> pd.DataFram
             if gg.shape[0] < MIN_TRADES:
                 continue
 
-            base = {"timeframe": tf, "setup": setup, "side": side, "rr": rr, "feature": feat, "bucket": "ALL"}
+            base = {
+                "timeframe": tf, "setup": setup, "side": side, "rr": rr,
+                "feature": feat, "bucket": "ALL",
+                "thr_lo": np.nan, "thr_hi": np.nan
+            }
             base.update(stats_from_subset(gg))
-            base.update({"thr_lo": np.nan, "thr_hi": np.nan})
             rows.append(base)
 
+            # discreto -> buckets por valor (como string numérica)
             if is_discrete_feature(gg[feat]):
-                # agrupa por valor (como string numérica)
-                values = gg[feat].map(lambda x: f"{float(x):g}" if pd.notna(x) else np.nan)
+                values = gg[feat].map(lambda x: "{:g}".format(float(x)) if pd.notna(x) else np.nan)
                 gg2 = gg.copy()
                 gg2["_val"] = values
+
                 for v, sub in gg2.groupby("_val", dropna=True):
                     if sub.shape[0] < MIN_TRADES:
                         continue
-                    row = {"timeframe": tf, "setup": setup, "side": side, "rr": rr, "feature": feat, "bucket": f"val={v}"}
+                    row = {
+                        "timeframe": tf, "setup": setup, "side": side, "rr": rr,
+                        "feature": feat, "bucket": "val={}".format(v)
+                    }
                     row.update(stats_from_subset(sub))
                     try:
                         vv = float(v)
                     except Exception:
                         vv = np.nan
-                    row.update({"thr_lo": vv, "thr_hi": vv})
+                    row["thr_lo"] = vv
+                    row["thr_hi"] = vv
                     rows.append(row)
                 continue
 
+            # contínuo -> low/high percentis
             for p in PCTS:
                 q_lo = gg[feat].quantile(p / 100.0)
                 q_hi = gg[feat].quantile(1.0 - p / 100.0)
@@ -152,27 +162,33 @@ def univariate_report(long_df: pd.DataFrame, features: list[str]) -> pd.DataFram
                 high = gg[gg[feat] >= q_hi]
 
                 if low.shape[0] >= MIN_TRADES:
-                    row = {"timeframe": tf, "setup": setup, "side": side, "rr": rr, "feature": feat, "bucket": f"low{p}"}
+                    row = {"timeframe": tf, "setup": setup, "side": side, "rr": rr, "feature": feat, "bucket": "low{}".format(p)}
                     row.update(stats_from_subset(low))
-                    row.update({"thr_lo": np.nan, "thr_hi": float(q_lo)})
+                    row["thr_lo"] = np.nan
+                    row["thr_hi"] = float(q_lo)
                     rows.append(row)
 
                 if high.shape[0] >= MIN_TRADES:
-                    row = {"timeframe": tf, "setup": setup, "side": side, "rr": rr, "feature": feat, "bucket": f"high{p}"}
+                    row = {"timeframe": tf, "setup": setup, "side": side, "rr": rr, "feature": feat, "bucket": "high{}".format(p)}
                     row.update(stats_from_subset(high))
-                    row.update({"thr_lo": float(q_hi), "thr_hi": np.nan})
+                    row["thr_lo"] = float(q_hi)
+                    row["thr_hi"] = np.nan
                     rows.append(row)
 
-    cols = ["timeframe", "setup", "side", "rr", "feature", "bucket",
-            "trades", "wins", "losses", "win_rate", "win_rate_pct", "thr_lo", "thr_hi"]
+    cols = [
+        "timeframe", "setup", "side", "rr",
+        "feature", "bucket",
+        "trades", "wins", "losses", "win_rate", "win_rate_pct",
+        "thr_lo", "thr_hi"
+    ]
     return pd.DataFrame(rows, columns=cols)
 
 
 def make_bins(series: pd.Series, n_bins: int):
     """
     Retorna (bin_labels, bin_ranges)
-      - discreto: labels = string do valor, ranges={}
-      - contínuo: labels = códigos 0..k-1, ranges{code: (lo,hi)}
+      - discreto: labels=string do valor, ranges={}
+      - contínuo: labels=códigos 0..k-1, ranges{code:(lo,hi)}
     """
     s = safe_numeric(series)
     s_ok = s.dropna()
@@ -180,7 +196,7 @@ def make_bins(series: pd.Series, n_bins: int):
         return None, {}
 
     if s_ok.nunique() <= 6:
-        labels = s.map(lambda x: f"{float(x):g}" if pd.notna(x) else np.nan)
+        labels = s.map(lambda x: "{:g}".format(float(x)) if pd.notna(x) else np.nan)
         return labels, {}
 
     try:
@@ -232,7 +248,6 @@ def pairwise_report(long_df: pd.DataFrame, features: list[str]) -> pd.DataFrame:
                 a_lo, a_hi = (np.nan, np.nan)
                 b_lo, b_hi = (np.nan, np.nan)
 
-                # ranges só existem quando bin é inteiro (contínuo)
                 if isinstance(ba, (int, np.integer)) and int(ba) in range_cache[a]:
                     a_lo, a_hi = range_cache[a][int(ba)]
                 if isinstance(bb, (int, np.integer)) and int(bb) in range_cache[b]:
@@ -272,10 +287,10 @@ def pairwise_report(long_df: pd.DataFrame, features: list[str]) -> pd.DataFrame:
 
 def best_patterns_md(uni: pd.DataFrame, path: str):
     with open(path, "w", encoding="utf-8") as f:
-        f.write(f"# Best patterns (by side) — {SYMBOL}\n\n")
-        f.write(f"- MIN_TRADES: {MIN_TRADES}\n")
-        f.write(f"- Buckets: low/high {PCTS}\n")
-        f.write(f"- Thresholds: thr_lo/thr_hi\n\n")
+        f.write("# Best patterns (by side) — {}\n\n".format(SYMBOL))
+        f.write("- MIN_TRADES: {}\n".format(MIN_TRADES))
+        f.write("- Buckets: low/high {}\n".format(PCTS))
+        f.write("- Thresholds: thr_lo/thr_hi\n\n")
 
         if uni.empty:
             f.write("Sem dados.\n")
@@ -286,10 +301,39 @@ def best_patterns_md(uni: pd.DataFrame, path: str):
             g2 = g2.dropna(subset=["win_rate"])
             g2 = g2.sort_values(["win_rate", "trades"], ascending=[False, False]).head(TOP_K_BEST)
 
-            f.write(f"## {tf} | {setup} | {side} | RR {rr}\n\n")
+            f.write("## {} | {} | {} | RR {}\n\n".format(tf, setup, side, rr))
             f.write("| Feature | Bucket | Trades | WinRate | thr_lo | thr_hi |\n")
             f.write("|---|---|---:|---:|---:|---:|\n")
+
             for _, r in g2.iterrows():
-                thr_lo = "" if pd.isna(r["thr_lo"]) else f"{r['thr_lo']:.6g}"
-                thr_hi = "" if pd.isna(r["thr_hi"]) else f"{r['thr_hi']:.6g}"
-                f.write(f"| {r['feature']} | {r['bucket']} | {int(r['trades'])} | {r['win_rate_pct']} | 
+                thr_lo = "" if pd.isna(r["thr_lo"]) else "{:.6g}".format(r["thr_lo"])
+                thr_hi = "" if pd.isna(r["thr_hi"]) else "{:.6g}".format(r["thr_hi"])
+
+                f.write("| {} | {} | {} | {} | {} | {} |\n".format(
+                    r["feature"], r["bucket"], int(r["trades"]), r["win_rate_pct"], thr_lo, thr_hi
+                ))
+            f.write("\n")
+
+
+def main():
+    os.makedirs("results", exist_ok=True)
+
+    if not os.path.isfile(INPUT_PATH):
+        raise FileNotFoundError("Não achei {}. Rode o backtest primeiro.".format(INPUT_PATH))
+
+    trades = pd.read_csv(INPUT_PATH)
+    long_df = melt_outcomes(trades)
+
+    features = pick_feature_columns(long_df)
+
+    uni = univariate_report(long_df, features)
+    uni.to_csv("results/patterns_univariate_{}.csv".format(SYMBOL), index=False)
+
+    pair = pairwise_report(long_df, features)
+    pair.to_csv("results/patterns_pairwise_{}.csv".format(SYMBOL), index=False)
+
+    best_patterns_md(uni, "results/patterns_best_{}.md".format(SYMBOL))
+
+
+if __name__ == "__main__":
+    main()
