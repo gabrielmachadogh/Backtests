@@ -14,13 +14,15 @@ jobs:
       SYMBOL: BTC_USDT
       TIMEFRAMES: 1h,2h,4h,1d,1w
       SETUPS: PFR,DL,IB
-      SMA_SHORT: "10"
-      SMA_LONG: "100"
+
+      MA_PAIRS: 9:90,8:80,10:100,13:130,20:200
       SLOPE_PERIOD: "5"
+
       RRS: "1,1.5,2"
       AMBIGUOUS_POLICY: loss
       MAX_ENTRY_WAIT_BARS: "3"
       MAX_HOLD_BARS: "50"
+
       MAX_BARS_1H: "20000"
       WINDOW_DAYS: "30"
       TICK_SIZE: "0"
