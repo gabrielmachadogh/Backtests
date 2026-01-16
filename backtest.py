@@ -18,8 +18,8 @@ SETUPS = [x.strip().upper() for x in os.getenv("SETUPS", "PFR,DL,IB").split(",")
 SMA_SHORT = int(os.getenv("SMA_SHORT", "10"))
 SMA_LONG = int(os.getenv("SMA_LONG", "100"))
 
-# Filtro de inclinação (por padrão usa SMA10 e compara com o candle anterior)
-SLOPE_LOOKBACK = int(os.getenv("SLOPE_LOOKBACK", "1"))  # 1 = sma10[i] vs sma10[i-1]
+# Inclinação: média da variação da SMA10 nos últimos N candles (default 5)
+SLOPE_PERIOD = int(os.getenv("SLOPE_PERIOD", "5"))
 
 # RRs para simular (sem 3:1)
 RRS = [float(x) for x in os.getenv("RRS", "1,1.5,2").split(",")]
@@ -216,9 +216,11 @@ def add_trend_columns(df: pd.DataFrame) -> pd.DataFrame:
         & (x["sma10"] < x["sma100"])
     )
 
-    # inclinação SMA10
-    x["sma10_slope_up"] = x["sma10"] > x["sma10"].shift(SLOPE_LOOKBACK)
-    x["sma10_slope_down"] = x["sma10"] < x["sma10"].shift(SLOPE_LOOKBACK)
+    # Inclinação baseada nos últimos SLOPE_PERIOD candles:
+    # slope = média dos diffs recentes da SMA10
+    x["sma10_slope"] = x["sma10"].diff().rolling(SLOPE_PERIOD).mean()
+    x["sma10_slope_up"] = x["sma10_slope"] > 0
+    x["sma10_slope_down"] = x["sma10_slope"] < 0
 
     return x
 
@@ -332,9 +334,6 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
     start = max(SMA_LONG + 2, 2)
 
     def add_trade(i: int, setup_name: str, side: str):
-        # entrada por rompimento do candle do setup:
-        # long: high[i] + tick
-        # short: low[i] - tick
         if side == "long":
             entry_price = float(x.loc[i, "high"]) + tick
             stop_price = float(x.loc[i, "low"]) - tick
@@ -364,12 +363,17 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
         if pd.isna(x.loc[i, "sma10"]) or pd.isna(x.loc[i, "sma100"]):
             continue
 
+        # precisa ter slope calculado
+        if pd.isna(x.loc[i, "sma10_slope"]):
+            continue
+
         trend_up = bool(x.loc[i, "trend_up"])
         trend_down = bool(x.loc[i, "trend_down"])
+
         slope_up = bool(x.loc[i, "sma10_slope_up"])
         slope_down = bool(x.loc[i, "sma10_slope_down"])
 
-        # Compra: tendência de alta + SMA inclinada pra cima
+        # Compra: tendência alta + inclinação positiva
         if trend_up and slope_up:
             if "PFR" in SETUPS and pfr_buy_signal(x, i):
                 add_trade(i, "PFR", "long")
@@ -378,7 +382,7 @@ def backtest_setups(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
             if "IB" in SETUPS and ib_signal(x, i):
                 add_trade(i, "IB", "long")
 
-        # Venda: tendência de baixa + SMA inclinada pra baixo
+        # Venda: tendência baixa + inclinação negativa
         if trend_down and slope_down:
             if "PFR" in SETUPS and pfr_sell_signal(x, i):
                 add_trade(i, "PFR", "short")
@@ -433,7 +437,7 @@ def save_markdown(summary_df: pd.DataFrame, path: str):
         f.write(f"- Gerado em UTC: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}\n")
         f.write(f"- Timeframes: `{', '.join(TIMEFRAMES)}`\n")
         f.write(f"- Tendência: SMA{SMA_SHORT}/SMA{SMA_LONG} (close acima/abaixo das duas + cruzamento)\n")
-        f.write(f"- Filtro extra: inclinação SMA{SMA_SHORT} (buy: up | sell: down), lookback={SLOPE_LOOKBACK}\n")
+        f.write(f"- Filtro inclinação: média da variação da SMA{SMA_SHORT} nos últimos {SLOPE_PERIOD} candles (buy>0, sell<0)\n")
         f.write(f"- Setups: `{', '.join(SETUPS)}`\n")
         f.write(f"- RRs: `{', '.join([str(r) for r in RRS])}`\n")
         f.write(f"- MAX_ENTRY_WAIT_BARS: `{MAX_ENTRY_WAIT_BARS}` | MAX_HOLD_BARS: `{MAX_HOLD_BARS}` | AMBIGUOUS_POLICY: `{AMBIGUOUS_POLICY}`\n\n")
@@ -452,13 +456,6 @@ def save_markdown(summary_df: pd.DataFrame, path: str):
 
 def main():
     os.makedirs("results", exist_ok=True)
-
-    print(f"[info] SYMBOL={SYMBOL}")
-    print(f"[info] TIMEFRAMES={TIMEFRAMES}")
-    print(f"[info] SETUPS={SETUPS}")
-    print(f"[info] SMA={SMA_SHORT}/{SMA_LONG} | SLOPE_LOOKBACK={SLOPE_LOOKBACK} | RRs={RRS}")
-    print(f"[info] MAX_ENTRY_WAIT_BARS={MAX_ENTRY_WAIT_BARS} MAX_HOLD_BARS={MAX_HOLD_BARS} AMBIGUOUS_POLICY={AMBIGUOUS_POLICY}")
-    print(f"[info] MAX_BARS_1H={MAX_BARS_1H} WINDOW_DAYS={WINDOW_DAYS} TICK_SIZE={TICK_SIZE}")
 
     df_1h = fetch_ohlcv_1h_max(SYMBOL, max_bars=MAX_BARS_1H, window_days=WINDOW_DAYS)
     if df_1h.empty:
@@ -481,7 +478,7 @@ def main():
         df = tf_map.get(tf)
         if df is None or df.empty:
             continue
-        if len(df) < (SMA_LONG + 10):
+        if len(df) < (SMA_LONG + SLOPE_PERIOD + 10):
             continue
         all_results.append(backtest_setups(df, tf))
 
@@ -491,8 +488,6 @@ def main():
     trades_df.to_csv(f"results/backtest_trades_{SYMBOL}.csv", index=False)
     summary_df.to_csv(f"results/backtest_summary_{SYMBOL}.csv", index=False)
     save_markdown(summary_df, f"results/backtest_summary_{SYMBOL}.md")
-
-    print("[info] Salvo em results/")
 
 
 if __name__ == "__main__":
