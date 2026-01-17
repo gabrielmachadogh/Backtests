@@ -9,7 +9,7 @@ BASE_URL = os.getenv("MEXC_CONTRACT_BASE_URL", "https://contract.mexc.com/api/v1
 SYMBOL = os.getenv("SYMBOL", "BTC_USDT")
 
 TIMEFRAMES = [x.strip().lower() for x in os.getenv("TIMEFRAMES", "1h,2h,4h,1d,1w").split(",") if x.strip()]
-SETUPS = [x.strip().upper() for x in os.getenv("SETUPS", "PFR,DL").split(",") if x.strip()]
+SETUPS = [x.strip().upper() for x in os.getenv("SETUPS", "PFR,DL,8.2,8.3").split(",") if x.strip()]
 
 SMA_SHORT = int(os.getenv("SMA_SHORT", "8"))
 SMA_LONG = int(os.getenv("SMA_LONG", "80"))
@@ -22,7 +22,7 @@ EXTREME_LOOKBACK = 20
 
 RRS = [float(x) for x in os.getenv("RRS", "1,1.5,2").split(",")]
 AMBIGUOUS_POLICY = os.getenv("AMBIGUOUS_POLICY", "loss").lower()
-MAX_ENTRY_WAIT_BARS = int(os.getenv("MAX_ENTRY_WAIT_BARS", "1")) 
+MAX_ENTRY_WAIT_BARS = int(os.getenv("MAX_ENTRY_WAIT_BARS", "3"))
 MAX_HOLD_BARS = 50
 
 MAX_BARS_1H = int(os.getenv("MAX_BARS_1H", "25000"))
@@ -81,7 +81,7 @@ def fetch_history(symbol, max_bars):
     end_ts = int(time.time())
     step = WINDOW_DAYS * 86400
     
-    while len(all_dfs) * 24 * WINDOW_DAYS < max_bars + 5000: 
+    while len(all_dfs) * 24 * WINDOW_DAYS < max_bars + 5000:
         start_ts = end_ts - step
         url = f"{BASE_URL}/contract/kline/{symbol}"
         data = http_get_json(url, {'interval': 'Min60', 'start': start_ts, 'end': end_ts})
@@ -109,11 +109,8 @@ def add_indicators(df):
     x = df.copy()
     x['sma_s'] = x['close'].rolling(SMA_SHORT).mean()
     x['sma_l'] = x['close'].rolling(SMA_LONG).mean()
-    
-    # Tendência de Alta
     x['trend_up'] = (x['close'] > x['sma_s']) & (x['close'] > x['sma_l']) & (x['sma_s'] > x['sma_l'])
     
-    # Inclinação
     prev_max = x['sma_s'].shift(1).rolling(SLOPE_LOOKBACK).max()
     x['slope_up'] = x['sma_s'] > prev_max
     x['slope_strength'] = x['sma_s'] - prev_max 
@@ -124,16 +121,11 @@ def add_indicators(df):
     
     x['range'] = x['high'] - x['low']
     x['body'] = abs(x['close'] - x['open'])
-    x['upper_wick'] = x['high'] - np.maximum(x['open'], x['close'])
     x['lower_wick'] = np.minimum(x['open'], x['close']) - x['low']
-    
-    # Avoid div by zero
-    x['range_pct'] = (x['range'] / x['close']) * 100
-    x['body_pct'] = np.where(x['range']>0, (x['body'] / x['range']) * 100, 0)
-    x['lower_wick_pct'] = np.where(x['range']>0, (x['lower_wick'] / x['range']) * 100, 0)
-    x['clv'] = np.where(x['range']>0, (x['close'] - x['low']) / x['range'], 0.5)
-    
-    x['ret_1_pct'] = x['close'].pct_change(1) * 100
+    x['lower_wick_pct'] = (x['lower_wick'] / x['range']) * 100
+    x['upper_wick'] = x['high'] - np.maximum(x['open'], x['close'])
+    x['upper_wick_pct'] = (x['upper_wick'] / x['range']) * 100
+    x['clv'] = (x['close'] - x['low']) / x['range']
     x['ret_5_pct'] = x['close'].pct_change(5) * 100
     
     delta = x['close'].diff()
@@ -152,9 +144,7 @@ def add_indicators(df):
     
     rn_hi = x['high'].rolling(LOOKBACK_N).max()
     rn_lo = x['low'].rolling(LOOKBACK_N).min()
-    rng_diff = rn_hi - rn_lo
-    x['pos_in_range_n'] = np.where(rng_diff>0, (x['close'] - rn_lo) / rng_diff, 0.5)
-    
+    x['pos_in_range_n'] = (x['close'] - rn_lo) / (rn_hi - rn_lo)
     x['vol_z'] = (x['volume'] - x['volume'].rolling(20).mean()) / x['volume'].rolling(20).std()
 
     return x
@@ -167,7 +157,13 @@ def check_signals(x, i):
     dl = (x['low'].iloc[i] < x['low'].iloc[i-1]) and \
          (x['low'].iloc[i] < x['low'].iloc[i-2])
          
-    return pfr, dl
+    setup_82 = x['close'].iloc[i] < x['low'].iloc[i-1]
+    
+    setup_83 = (x['close'].iloc[i] < x['close'].iloc[i-2]) and \
+               (x['close'].iloc[i-1] < x['close'].iloc[i-2]) and \
+               (x['close'].iloc[i-1] >= x['low'].iloc[i-2]) 
+               
+    return pfr, dl, setup_82, setup_83
 
 def run_backtest(df, tf):
     x = add_indicators(df)
@@ -176,26 +172,46 @@ def run_backtest(df, tf):
     trades = []
     start_idx = max(SMA_LONG, 50)
     
-    for i in range(start_idx, len(x) - MAX_ENTRY_WAIT_BARS - 1):
+    for i in range(start_idx, len(x) - MAX_ENTRY_WAIT_BARS - 5):
         if not (x['trend_up'].iloc[i] and x['slope_up'].iloc[i]):
             continue
             
-        pfr, dl = check_signals(x, i)
-        if not (pfr or dl): continue
+        pfr, dl, s82, s83 = check_signals(x, i)
         
         active_setups = []
         if pfr and 'PFR' in SETUPS: active_setups.append('PFR')
         if dl and 'DL' in SETUPS and not pfr: active_setups.append('DL')
+        if s82 and '8.2' in SETUPS: active_setups.append('8.2')
+        if s83 and '8.3' in SETUPS: active_setups.append('8.3')
+        
+        if not active_setups: continue
         
         for setup in active_setups:
             entry_price = x['high'].iloc[i] + tick
             stop_price = x['low'].iloc[i] - tick
             
-            next_bar = x.iloc[i+1]
-            if next_bar['high'] < entry_price:
-                continue
+            filled = False
+            fill_idx = -1
+            
+            for w in range(1, MAX_ENTRY_WAIT_BARS + 1):
+                curr_idx = i + w
+                if curr_idx >= len(x): break
+                curr_bar = x.iloc[curr_idx]
                 
-            fill_idx = i + 1
+                if curr_bar['high'] >= entry_price:
+                    filled = True
+                    fill_idx = curr_idx
+                    break
+                
+                if setup in ['8.2', '8.3']:
+                    if not x['slope_up'].iloc[curr_idx]: break
+                    if curr_bar['high'] < (entry_price - tick):
+                        entry_price = curr_bar['high'] + tick
+                        stop_price = min(stop_price, curr_bar['low'] - tick)
+                else:
+                    if w >= 1: break
+                
+            if not filled: continue
             
             feat = {
                 'timeframe': tf, 'setup': setup,
@@ -206,4 +222,131 @@ def run_backtest(df, tf):
                 'atr_pct': x['atr_pct'].iloc[i],
                 'clv': x['clv'].iloc[i],
                 'lower_wick_pct': x['lower_wick_pct'].iloc[i],
+                'pos_in_range_n': x['pos_in_range_n'].iloc[i],
+                'ret_5_pct': x['ret_5_pct'].iloc[i],
+                'vol_z': x['vol_z'].iloc[i]
+            }
+            
+            for rr in RRS:
+                risk = entry_price - stop_price
+                target = entry_price + (risk * rr)
+                outcome = 'loss'
                 
+                for k in range(fill_idx, min(fill_idx + MAX_HOLD_BARS, len(x))):
+                    curr = x.iloc[k]
+                    hit_stop = curr['low'] <= stop_price
+                    hit_target = curr['high'] >= target
+                    
+                    if hit_stop and hit_target:
+                        outcome = AMBIGUOUS_POLICY
+                        break
+                    elif hit_stop:
+                        outcome = 'loss'
+                        break
+                    elif hit_target:
+                        outcome = 'win'
+                        break
+                
+                feat[f"rr_{rr}"] = outcome
+            
+            trades.append(feat)
+            
+    return pd.DataFrame(trades)
+
+def analyze_buckets(trades_df):
+    if trades_df.empty: return pd.DataFrame()
+    features = [
+        'slope_strength', 'bars_since_new_high', 'pullback_from_new_high_pct',
+        'dist_to_sma80_pct', 'atr_pct', 'clv', 'lower_wick_pct', 
+        'pos_in_range_n', 'ret_5_pct', 'vol_z'
+    ]
+    report_rows = []
+    for rr in RRS:
+        rr_col = f"rr_{rr}"
+        df_clean = trades_df[trades_df[rr_col].isin(['win', 'loss'])].copy()
+        for (tf, setup), g in df_clean.groupby(['timeframe', 'setup']):
+            total = len(g)
+            if total < 30: continue
+            wins = (g[rr_col] == 'win').sum()
+            wr_base = wins / total
+            report_rows.append({
+                'TF': tf, 'Setup': setup, 'RR': rr, 
+                'Feature': 'ALL', 'Bucket': 'ALL',
+                'Trades': total, 'WinRate': wr_base,
+                'Thr_Lo': np.nan, 'Thr_Hi': np.nan
+            })
+            for feat in features:
+                try:
+                    q25 = g[feat].quantile(0.25)
+                    g_low = g[g[feat] <= q25]
+                    if len(g_low) >= 20:
+                        w_l = (g_low[rr_col] == 'win').sum()
+                        report_rows.append({
+                            'TF': tf, 'Setup': setup, 'RR': rr,
+                            'Feature': feat, 'Bucket': 'Low25',
+                            'Trades': len(g_low), 'WinRate': w_l/len(g_low),
+                            'Thr_Lo': np.nan, 'Thr_Hi': q25
+                        })
+                    q75 = g[feat].quantile(0.75)
+                    g_high = g[g[feat] >= q75]
+                    if len(g_high) >= 20:
+                        w_h = (g_high[rr_col] == 'win').sum()
+                        report_rows.append({
+                            'TF': tf, 'Setup': setup, 'RR': rr,
+                            'Feature': feat, 'Bucket': 'High25',
+                            'Trades': len(g_high), 'WinRate': w_h/len(g_high),
+                            'Thr_Lo': q75, 'Thr_Hi': np.nan
+                        })
+                except: pass
+    return pd.DataFrame(report_rows)
+
+def main():
+    print(f"--- Iniciando Backtest LONG ONLY para {SYMBOL} ---")
+    df_raw = fetch_history(SYMBOL, MAX_BARS_1H)
+    if df_raw.empty: return
+
+    all_trades = []
+    tf_map = {'1h': df_raw}
+    if '2h' in TIMEFRAMES: tf_map['2h'] = resample(df_raw, '2h')
+    if '4h' in TIMEFRAMES: tf_map['4h'] = resample(df_raw, '4h')
+    if '1d' in TIMEFRAMES: tf_map['1d'] = resample(df_raw, '1D')
+    if '1w' in TIMEFRAMES: tf_map['1w'] = resample(df_raw, 'W-SUN')
+    
+    for tf_name in TIMEFRAMES:
+        if tf_name not in tf_map: continue
+        print(f"Processando {tf_name}...")
+        df_tf = tf_map[tf_name]
+        trades = run_backtest(df_tf, tf_name)
+        all_trades.append(trades)
+        
+    final_df = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+    os.makedirs("results", exist_ok=True)
+    
+    if final_df.empty:
+        print("Nenhum trade encontrado.")
+        # Salva arquivo vazio para garantir que o workflow não quebre no upload
+        pd.DataFrame(columns=['timeframe', 'setup']).to_csv(f"results/backtest_trades_{SYMBOL}.csv", index=False)
+        return
+        
+    final_df.to_csv(f"results/backtest_trades_{SYMBOL}.csv", index=False)
+    
+    print("Analisando padrões...")
+    report = analyze_buckets(final_df)
+    if not report.empty:
+        diamonds = report[report['WinRate'] >= 0.60].sort_values('WinRate', ascending=False)
+        report['WinRate'] = report['WinRate'].apply(fmt_pct)
+        diamonds['WinRate'] = diamonds['WinRate'].apply(fmt_pct)
+        
+        report.to_csv(f"results/full_report_{SYMBOL}.csv", index=False)
+        
+        with open(f"results/best_long_patterns_{SYMBOL}.md", "w") as f:
+            f.write(f"# Top Long Setups (Winrate > 60%) - {SYMBOL}\n\n")
+            try:
+                f.write(tabulate(diamonds, headers="keys", tablefmt="pipe", showindex=False))
+            except:
+                f.write(diamonds.to_string())
+    
+    print("Concluído.")
+
+if __name__ == "__main__":
+    main()
