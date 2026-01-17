@@ -14,32 +14,33 @@ from itertools import product
 #   Se não houver 1D nativo disponível, configs com HTF são removidas.
 #
 # SETUPS:
-# - PFR / DL / 8.2 / 8.3:
-#     Agora só executam se o "mercado direcional" estiver presente:
-#       * SMA10 > SMA15 > SMA20 > SMA25 > SMA30 > SMA35 > SMA40 > SMA45
-#       * SMA10 apontando pra cima (SMA10 > SMA10[-1])
-#       * close > SMA10   (mantido como parte do direcional)
-#
-# - MA_LADDER (novo):
+# - MA_LADDER:
 #     * ARMA quando close>sma10 e sma10>sma15>...>sma45
 #     * depois de armado, não precisa manter alinhado
 #     * DESARMA se close < sma40
 #     * "tocar na média" = low <= MA
-#     * ao tocar, gatilho de entrada = high do candle + 1 tick (vale pro próximo candle)
-#     * stop = abaixo da MA imediatamente "abaixo" da tocada (10->15, ..., 40->45, 45->45)
+#     * gatilho entry = high do candle + 1 tick (vale pro próximo candle)
+#     * stop = abaixo da MA imediatamente abaixo da tocada (10->15, ..., 40->45, 45->45)
 #     * enquanto não entra:
-#         - ENTRY rola (vira high do candle atual + tick)
-#         - STOP fica TRAVADO no valor do candle do toque mais baixo atual
-#         - se tocar uma MA mais baixa (period maior), atualiza o stop (novo valor) e trava de novo
+#         - ENTRY rola (high do candle atual + tick)
+#         - STOP fica TRAVADO no valor do candle do toque mais baixo vigente
+#         - se tocar MA mais baixa, atualiza o stop (novo valor) e trava de novo
 #
-# Experimentos (A/B):
+# - PFR / DL / 8.2 / 8.3:
+#     Só executam se "mercado direcional" no 4h:
+#       * alinhamento: sma10>sma15>...>sma45
+#       * sma10 apontando para cima (sma10 > sma10[-1])
+#       * close> sma10 (TESTÁVEL com e sem)
+#
+# Experimentos A/B (configs):
 # - HTF(native 1D) on/off (somente se 1D nativo existir)
 # - Time-exit on/off
 # - Break-even on/off (70% do alvo, efetivo no candle seguinte)
+# - Require close>sma10 for classics/HTF (c10) on/off
 #
-# Validação:
+# Ranking:
 # - Split TREINO/TESTE
-# - Ranking de configs por Test AvgR no RR escolhido
+# - Ranking configs por Test AvgR no RR escolhido
 # =========================================================
 
 # =============================
@@ -51,13 +52,8 @@ DEBUG = os.getenv("DEBUG", "0") == "1"
 
 TRADING_TF = "4h"
 
-# Para testar só o MA_LADDER:
-#   SETUPS="MA_LADDER"
 SETUPS = [s.strip() for s in os.getenv("SETUPS", "MA_LADDER,PFR,DL,8.2,8.3").split(",") if s.strip()]
-
-# Ranking/relatórios podem focar em 1 setup:
-#   RANK_SETUP="MA_LADDER"
-RANK_SETUP = os.getenv("RANK_SETUP", "ALL")  # "ALL" ou "MA_LADDER" ou "PFR" etc.
+RANK_SETUP = os.getenv("RANK_SETUP", "ALL")  # "ALL" ou "MA_LADDER" etc.
 
 # Ladder MAs
 LADDER_MAS = [10, 15, 20, 25, 30, 35, 40, 45]
@@ -78,10 +74,10 @@ WINDOW_DAYS_1D = int(os.getenv("WINDOW_DAYS_1D", "365"))
 
 SAVE_OHLCV = os.getenv("SAVE_OHLCV", "1") == "1"
 
-# ----- HTF -----
+# HTF: exigir slope (sma10_up) no 1D
 HTF_REQUIRE_SLOPE = os.getenv("HTF_REQUIRE_SLOPE", "1") == "1"
 
-# ----- Exits -----
+# Exits
 TIME_EXIT_BARS = int(os.getenv("TIME_EXIT_BARS", "50"))              # em candles de 4h
 BE_TARGET_FRACTION = float(os.getenv("BE_TARGET_FRACTION", "0.70"))  # 70% do caminho até o alvo
 
@@ -263,11 +259,12 @@ def fetch_1d_native(symbol):
 # =============================
 # INDICATORS
 # =============================
-def add_indicators(df):
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
     for p in LADDER_MAS:
         x[f"sma{p}"] = x["close"].rolling(p).mean()
     x["sma10_up"] = x["sma10"] > x["sma10"].shift(1)
+    x["close_gt_sma10"] = x["close"] > x["sma10"]
     return x
 
 
@@ -275,9 +272,6 @@ def add_indicators(df):
 # MA alignment / regime helpers
 # =============================
 def ladder_aligned_strict(x, i) -> bool:
-    """
-    True se sma10 > sma15 > ... > sma45 (strict).
-    """
     for a, b in zip(LADDER_MAS[:-1], LADDER_MAS[1:]):
         va = x[f"sma{a}"].iloc[i]
         vb = x[f"sma{b}"].iloc[i]
@@ -288,39 +282,33 @@ def ladder_aligned_strict(x, i) -> bool:
     return True
 
 
-def classic_allowed_regime(x, i) -> bool:
+def classic_allowed_regime(x, i, cfg) -> bool:
     """
-    Regra nova:
-      - todas MAs alinhadas
-      - sma10 apontando para cima
-      - close > sma10
+    Clássicos (PFR/DL/8.2/8.3) só rodam se:
+      - alinhamento strict
+      - sma10_up
+      - e opcionalmente close>sma10 (cfg['req_close_gt10'])
     """
-    c = x["close"].iloc[i]
-    sma10 = x["sma10"].iloc[i]
-    if np.isnan(c) or np.isnan(sma10):
-        return False
-    if not (c > sma10):
+    if not ladder_aligned_strict(x, i):
         return False
     if not bool(x["sma10_up"].iloc[i]):
         return False
-    return ladder_aligned_strict(x, i)
+    if cfg["req_close_gt10"] and (not bool(x["close_gt_sma10"].iloc[i])):
+        return False
+    return True
 
 
 # =============================
 # SETUPS (clássicos)
 # =============================
 def check_signals_classic(x, i):
-    # PFR
     pfr = (
         (x["low"].iloc[i] < x["low"].iloc[i - 1])
         and (x["low"].iloc[i] < x["low"].iloc[i - 2])
         and (x["close"].iloc[i] > x["close"].iloc[i - 1])
     )
-    # DL
     dl = (x["low"].iloc[i] < x["low"].iloc[i - 1]) and (x["low"].iloc[i] < x["low"].iloc[i - 2])
-    # 8.2
     s82 = x["close"].iloc[i] < x["low"].iloc[i - 1]
-    # 8.3
     s83 = (
         (x["close"].iloc[i] < x["close"].iloc[i - 2])
         and (x["close"].iloc[i - 1] < x["close"].iloc[i - 2])
@@ -334,23 +322,19 @@ def check_signals_classic(x, i):
 # =============================
 def ladder_armed_condition(x, i) -> bool:
     """
-    Arma quando:
-      close > sma10
-      sma10 > sma15 > ... > sma45
+    Arma quando close>sma10 e alinhamento strict.
+    (Esse close>sma10 do LADDER fica fixo; não entra no A/B dos clássicos.)
     """
+    if not ladder_aligned_strict(x, i):
+        return False
     c = x["close"].iloc[i]
     sma10 = x["sma10"].iloc[i]
     if np.isnan(c) or np.isnan(sma10):
         return False
-    if not (c > sma10):
-        return False
-    return ladder_aligned_strict(x, i)
+    return c > sma10
 
 
 def ladder_disarm_condition(x, i) -> bool:
-    """
-    Desarma se close < SMA40.
-    """
     sma40 = x["sma40"].iloc[i]
     c = x["close"].iloc[i]
     if np.isnan(sma40) or np.isnan(c):
@@ -359,19 +343,13 @@ def ladder_disarm_condition(x, i) -> bool:
 
 
 def candle_touches_ma(low, ma_value) -> bool:
-    """
-    tocar = atingir o valor da média OU MENOR => low <= MA
-    """
+    # tocar = low <= MA
     if np.isnan(ma_value):
         return False
     return low <= ma_value
 
 
 def deepest_touched_ladder_ma(x, i):
-    """
-    Retorna o MA period mais "baixo" tocado no candle (maior período).
-    Touch = low <= MA.
-    """
     lo = x["low"].iloc[i]
     touched = []
     for p in LADDER_MAS:
@@ -384,9 +362,6 @@ def deepest_touched_ladder_ma(x, i):
 
 
 def ladder_below_period(touched_period: int) -> int:
-    """
-    "média abaixo da tocada": 10->15, ..., 40->45, 45->45 (fallback)
-    """
     if touched_period not in LADDER_MAS:
         return LADDER_MAS[-1]
     idx = LADDER_MAS.index(touched_period)
@@ -416,13 +391,11 @@ def simulate_trade_per_rr(x, fill_idx, entry, initial_stop, rr, cfg):
     for k in range(fill_idx, last_idx + 1):
         c = x.iloc[k]
 
-        # BE efetivo no início do candle seguinte ao trigger
         if cfg["use_breakeven"] and be_pending and not be_active:
             stop = entry
             be_active = True
             be_pending = False
 
-        # ordem conservadora intrabar: stop -> target -> trigger BE
         if c["low"] <= stop:
             r = (stop - entry) / risk
             return False, "stop" if stop < entry else "breakeven_stop", float(r), c["ts"]
@@ -448,10 +421,9 @@ def run_backtest_generate_trades_4h(df_4h, cfg, htf_flags_1d_native=None):
     x = add_indicators(df_4h).copy()
     if x.empty:
         return pd.DataFrame()
-
     x = x.sort_values("ts").reset_index(drop=True)
 
-    # HTF merge (1D nativo)
+    # Merge HTF 1D nativo
     if cfg["use_htf"]:
         if htf_flags_1d_native is None or htf_flags_1d_native.empty:
             return pd.DataFrame()
@@ -462,41 +434,42 @@ def run_backtest_generate_trades_4h(df_4h, cfg, htf_flags_1d_native=None):
             on="ts",
             direction="backward"
         )
-        x["htf_trend_up"] = tmp["htf_trend_up"].fillna(False).astype(bool)
-        x["htf_slope_up"] = tmp["htf_slope_up"].fillna(False).astype(bool)
-    else:
-        x["htf_trend_up"] = True
-        x["htf_slope_up"] = True
 
-    def htf_ok(i):
+        x["htf_aligned"] = tmp["htf_aligned"].fillna(False).astype(bool)
+        x["htf_sma10_up"] = tmp["htf_sma10_up"].fillna(False).astype(bool)
+        x["htf_close_gt10"] = tmp["htf_close_gt10"].fillna(False).astype(bool)
+    else:
+        x["htf_aligned"] = True
+        x["htf_sma10_up"] = True
+        x["htf_close_gt10"] = True
+
+    def htf_ok(i) -> bool:
         if not cfg["use_htf"]:
             return True
-        if not x["htf_trend_up"].iloc[i]:
+        if not x["htf_aligned"].iloc[i]:
             return False
-        if HTF_REQUIRE_SLOPE and (not x["htf_slope_up"].iloc[i]):
+        if cfg["req_close_gt10"] and (not x["htf_close_gt10"].iloc[i]):
+            return False
+        if HTF_REQUIRE_SLOPE and (not x["htf_sma10_up"].iloc[i]):
             return False
         return True
 
     tick = float(x["close"].iloc[-1] * 0.0001)
-    start_idx = max(50, max(LADDER_MAS) + 5, 3)  # precisa pelo menos de 45 candles
+
+    # precisa de SMA45 e de lookbacks de 2 candles pros clássicos
+    start_idx = max(max(LADDER_MAS) + 5, 5)
 
     trades = []
 
-    # -------------------------
-    # Estado do MA_LADDER
-    # -------------------------
+    # ---------- Estado do MA_LADDER ----------
     ladder_enabled = "MA_LADDER" in SETUPS
     ladder_armed = False
     ladder_armed_ts = pd.NaT
 
-    # mais baixo (maior período) tocado até agora
     ladder_touched_period = None
-    ladder_touch_idx = None  # candle onde ocorreu o toque mais baixo atual (que define o stop)
+    ladder_touch_idx = None
+    ladder_stop_fixed = None  # STOP travado (valor fixo do candle do toque mais baixo)
 
-    # STOP travado (congelado) no valor do candle do toque mais baixo atual
-    ladder_stop_fixed = None
-
-    # ordem pendente (vale para o próximo candle)
     ladder_pending = False
     ladder_pending_entry = None
     ladder_pending_stop = None
@@ -505,9 +478,7 @@ def run_backtest_generate_trades_4h(df_4h, cfg, htf_flags_1d_native=None):
     ladder_pending_touch_idx = None
 
     for i in range(start_idx, len(x)):
-        # -------------------------------------------------
-        # 1) Fill de ordem pendente do ladder
-        # -------------------------------------------------
+        # 1) Fill ordem pendente do ladder
         if ladder_enabled and ladder_pending:
             if x["high"].iloc[i] >= ladder_pending_entry:
                 fill_idx = i
@@ -526,8 +497,8 @@ def run_backtest_generate_trades_4h(df_4h, cfg, htf_flags_1d_native=None):
                     "setup": "MA_LADDER",
 
                     "armed_ts": ladder_armed_ts,
-                    "ladder_touch_ts": x["ts"].iloc[ti],   # candle que fixou o STOP
-                    "signal_ts": x["ts"].iloc[si],         # candle que definiu o ENTRY (rolando)
+                    "ladder_touch_ts": x["ts"].iloc[ti],
+                    "signal_ts": x["ts"].iloc[si],
                     "fill_ts": x["ts"].iloc[fill_idx],
 
                     "entry": entry,
@@ -540,6 +511,7 @@ def run_backtest_generate_trades_4h(df_4h, cfg, htf_flags_1d_native=None):
                     "use_htf": cfg["use_htf"],
                     "use_time_exit": cfg["use_time_exit"],
                     "use_breakeven": cfg["use_breakeven"],
+                    "req_close_gt10": cfg["req_close_gt10"],
                 }
 
                 for rr in RRS:
@@ -568,11 +540,9 @@ def run_backtest_generate_trades_4h(df_4h, cfg, htf_flags_1d_native=None):
                 ladder_pending_touch_period = None
                 ladder_pending_touch_idx = None
 
-        # -------------------------------------------------
-        # 2) SETUPS clássicos (agora com filtro do ladder + sma10_up)
-        # -------------------------------------------------
+        # 2) setups clássicos (com filtro direcional + HTF)
         if any(s in SETUPS for s in ["PFR", "DL", "8.2", "8.3"]):
-            if classic_allowed_regime(x, i) and htf_ok(i):
+            if i >= 2 and classic_allowed_regime(x, i, cfg) and htf_ok(i):
                 pfr, dl, s82, s83 = check_signals_classic(x, i)
 
                 active = []
@@ -604,4 +574,307 @@ def run_backtest_generate_trades_4h(df_4h, cfg, htf_flags_1d_native=None):
                             fill_idx = i + w
                             break
 
-                        if setup in 
+                        if setup in ["8.2", "8.3"]:
+                            # rolagem do gatilho (mantida)
+                            if curr["high"] < entry - tick:
+                                entry = float(curr["high"] + tick)
+                                stop = float(min(stop, curr["low"] - tick))
+                        else:
+                            break
+
+                    if not filled:
+                        continue
+
+                    risk = entry - stop
+                    if risk <= 0 or np.isnan(risk):
+                        continue
+
+                    row = {
+                        "config": cfg["name"],
+                        "timeframe": "4h",
+                        "setup": setup,
+
+                        "armed_ts": pd.NaT,
+                        "ladder_touch_ts": pd.NaT,
+                        "signal_ts": x["ts"].iloc[i],
+                        "fill_ts": x["ts"].iloc[fill_idx],
+
+                        "entry": entry,
+                        "stop": stop,
+                        "risk": risk,
+
+                        "ladder_touch_ma": np.nan,
+                        "ladder_stop_ma": np.nan,
+
+                        "use_htf": cfg["use_htf"],
+                        "use_time_exit": cfg["use_time_exit"],
+                        "use_breakeven": cfg["use_breakeven"],
+                        "req_close_gt10": cfg["req_close_gt10"],
+                    }
+
+                    for rr in RRS:
+                        hit, exit_type, r_res, exit_ts = simulate_trade_per_rr(
+                            x=x, fill_idx=fill_idx, entry=entry, initial_stop=stop, rr=rr, cfg=cfg
+                        )
+                        k = rr_key(rr)
+                        row[f"hit_{k}"] = bool(hit)
+                        row[f"exit_type_{k}"] = exit_type
+                        row[f"R_{k}"] = float(r_res) if r_res is not None else np.nan
+                        row[f"exit_ts_{k}"] = exit_ts
+
+                    trades.append(row)
+
+        # 3) MA_LADDER state machine
+        if ladder_enabled:
+            # desarma se close < sma40
+            if ladder_armed and ladder_disarm_condition(x, i):
+                ladder_armed = False
+                ladder_armed_ts = pd.NaT
+                ladder_touched_period = None
+                ladder_touch_idx = None
+                ladder_stop_fixed = None
+
+                ladder_pending = False
+                ladder_pending_entry = None
+                ladder_pending_stop = None
+                ladder_pending_signal_idx = None
+                ladder_pending_touch_period = None
+                ladder_pending_touch_idx = None
+                continue
+
+            # arma (com HTF ok, se HTF estiver ligado)
+            if (not ladder_armed) and ladder_armed_condition(x, i) and htf_ok(i):
+                ladder_armed = True
+                ladder_armed_ts = x["ts"].iloc[i]
+                ladder_touched_period = None
+                ladder_touch_idx = None
+                ladder_stop_fixed = None
+
+                ladder_pending = False
+                ladder_pending_entry = None
+                ladder_pending_stop = None
+                ladder_pending_signal_idx = None
+                ladder_pending_touch_period = None
+                ladder_pending_touch_idx = None
+
+            if ladder_armed:
+                # se HTF falhar, não rola ordem (mas mantém armado)
+                if not htf_ok(i):
+                    ladder_pending = False
+                    ladder_pending_entry = None
+                    ladder_pending_stop = None
+                    ladder_pending_signal_idx = None
+                    ladder_pending_touch_period = None
+                    ladder_pending_touch_idx = None
+                else:
+                    touched = deepest_touched_ladder_ma(x, i)
+
+                    # atualiza se tocou MA mais baixa
+                    if touched is not None:
+                        if ladder_touched_period is None or touched > ladder_touched_period:
+                            ladder_touched_period = touched
+                            ladder_touch_idx = i
+
+                            below_p = ladder_below_period(ladder_touched_period)
+                            below_ma_val = x[f"sma{below_p}"].iloc[i]
+                            if np.isnan(below_ma_val):
+                                ladder_stop_fixed = None
+                            else:
+                                ladder_stop_fixed = float(below_ma_val - tick)  # FIXO
+
+                    if ladder_touched_period is not None and ladder_stop_fixed is not None:
+                        ladder_pending = True
+                        ladder_pending_entry = float(x["high"].iloc[i] + tick)  # ENTRY rola
+                        ladder_pending_stop = float(ladder_stop_fixed)          # STOP travado
+                        ladder_pending_signal_idx = i
+                        ladder_pending_touch_period = ladder_touched_period
+                        ladder_pending_touch_idx = ladder_touch_idx
+                    else:
+                        ladder_pending = False
+                        ladder_pending_entry = None
+                        ladder_pending_stop = None
+                        ladder_pending_signal_idx = None
+                        ladder_pending_touch_period = None
+                        ladder_pending_touch_idx = None
+
+    return pd.DataFrame(trades)
+
+
+# =============================
+# CONFIGS (variáveis estruturais)
+# =============================
+def build_structural_configs(htf_available: bool):
+    configs = []
+    use_htf_options = [False, True] if htf_available else [False]
+
+    for use_htf, use_time_exit, use_breakeven, req_close_gt10 in product(
+        use_htf_options, [False, True], [False, True], [False, True]
+    ):
+        name = f"htf{int(use_htf)}_tx{int(use_time_exit)}_be{int(use_breakeven)}_c10{int(req_close_gt10)}"
+        configs.append({
+            "name": name,
+            "use_htf": use_htf,
+            "use_time_exit": use_time_exit,
+            "use_breakeven": use_breakeven,
+            "req_close_gt10": req_close_gt10,
+        })
+
+    if len(configs) > MAX_CONFIGS:
+        configs = configs[:MAX_CONFIGS]
+    return configs
+
+
+# =============================
+# METRICS / SUMMARIES
+# =============================
+def split_train_test(trades_df):
+    if trades_df.empty:
+        return trades_df.copy(), trades_df.copy(), pd.NaT
+    trades_df = trades_df.sort_values("fill_ts").reset_index(drop=True)
+    cutoff = trades_df["fill_ts"].quantile(TRAIN_FRACTION)
+    train = trades_df[trades_df["fill_ts"] <= cutoff].copy()
+    test = trades_df[trades_df["fill_ts"] > cutoff].copy()
+    return train, test, cutoff
+
+
+def metrics_overall(trades_df, rr):
+    if trades_df.empty:
+        return {"Trades": 0, "WR": np.nan, "AvgR": np.nan}
+    k = rr_key(rr)
+    trades = len(trades_df)
+    wr = float(trades_df[f"hit_{k}"].mean()) if trades > 0 else np.nan
+    avgr = float(trades_df[f"R_{k}"].mean()) if trades > 0 else np.nan
+    return {"Trades": trades, "WR": wr, "AvgR": avgr}
+
+
+# =============================
+# MAIN
+# =============================
+def main():
+    os.makedirs("results", exist_ok=True)
+
+    # 1) Baixa 4h
+    df_4h = fetch_4h(SYMBOL)
+    if df_4h.empty:
+        print("Erro: Sem dados 4h baixados.")
+        pd.DataFrame({"status": ["no_4h_data"]}).to_csv(f"results/only4h_{SYMBOL}.csv", index=False)
+        return
+
+    if SAVE_OHLCV:
+        df_4h.to_csv(f"results/ohlcv_{SYMBOL}_4h.csv", index=False)
+
+    # 2) Baixa 1d nativo (somente para HTF)
+    htf_flags_1d_native = None
+    htf_available = False
+
+    if DOWNLOAD_NATIVE_1D_FOR_HTF:
+        df_1d_native = fetch_1d_native(SYMBOL)
+        if not df_1d_native.empty:
+            if SAVE_OHLCV:
+                df_1d_native.to_csv(f"results/ohlcv_{SYMBOL}_1d_native.csv", index=False)
+
+            ind_1d = add_indicators(df_1d_native).sort_values("ts").reset_index(drop=True)
+
+            # HTF flags: alinhamento + sma10_up + close>10 (esse último será opcional por config)
+            aligned_list = []
+            for i in range(len(ind_1d)):
+                aligned_list.append(ladder_aligned_strict(ind_1d, i))
+
+            ind_1d["aligned"] = pd.Series(aligned_list, index=ind_1d.index).astype(bool)
+
+            htf_flags_1d_native = ind_1d[["ts", "aligned", "sma10_up", "close_gt_sma10"]].rename(columns={
+                "aligned": "htf_aligned",
+                "sma10_up": "htf_sma10_up",
+                "close_gt_sma10": "htf_close_gt10",
+            })
+
+            htf_available = True
+        else:
+            print("Aviso: não foi possível baixar 1d nativo; configs com HTF serão DESABILITADAS.")
+            htf_available = False
+    else:
+        print("DOWNLOAD_NATIVE_1D_FOR_HTF=0 => HTF desabilitado por regra.")
+        htf_available = False
+
+    # 3) Configs estruturais (inclui c10 0/1)
+    configs = build_structural_configs(htf_available=htf_available)
+    print(f"ONLY 4H | HTF(native1d) available={htf_available} | configs={len(configs)}")
+    print(f"SETUPS={SETUPS} | RANK_SETUP={RANK_SETUP} | RANK_RR={RANK_RR}")
+    print("Obs: configs incluem _c10{0|1} para testar close>sma10 nos clássicos/HTF.")
+
+    # 4) Gera trades
+    all_trades = []
+    for cfg in configs:
+        print(f"Gerando trades 4h: {cfg['name']} ...")
+        try:
+            t = run_backtest_generate_trades_4h(
+                df_4h=df_4h,
+                cfg=cfg,
+                htf_flags_1d_native=htf_flags_1d_native
+            )
+            if not t.empty:
+                all_trades.append(t)
+        except Exception as e:
+            print(f"Erro em {cfg['name']}: {e}")
+
+    if not all_trades:
+        print("0 trades gerados.")
+        pd.DataFrame({"status": ["no_trades"]}).to_csv(f"results/only4h_{SYMBOL}.csv", index=False)
+        return
+
+    trades = pd.concat(all_trades, ignore_index=True)
+    trades.to_csv(f"results/only4h_trades_raw_{SYMBOL}.csv", index=False)
+
+    # 5) Treino/teste
+    train, test, cutoff = split_train_test(trades)
+    print(f"Cutoff treino/teste: {cutoff}")
+
+    train_rank = filter_for_rank(train)
+    test_rank = filter_for_rank(test)
+
+    # 6) Stage 1 ranking
+    stage1_rows = []
+    for cfg_name, _ in trades.groupby("config"):
+        tr = train_rank[train_rank["config"] == cfg_name]
+        te = test_rank[test_rank["config"] == cfg_name]
+        m_tr = metrics_overall(tr, RANK_RR)
+        m_te = metrics_overall(te, RANK_RR)
+
+        stage1_rows.append({
+            "Config": cfg_name,
+            "Train Trades": m_tr["Trades"],
+            "Train WR": m_tr["WR"],
+            "Train AvgR": m_tr["AvgR"],
+            "Test Trades": m_te["Trades"],
+            "Test WR": m_te["WR"],
+            "Test AvgR": m_te["AvgR"],
+            "Eligible": (m_te["Trades"] >= MIN_TRADES_FOR_RANK_TEST),
+        })
+
+    stage1 = pd.DataFrame(stage1_rows).sort_values(
+        ["Eligible", "Test AvgR", "Test Trades"],
+        ascending=[False, False, False]
+    )
+    stage1.to_csv(f"results/only4h_stage1_structural_{SYMBOL}.csv", index=False)
+
+    print("\n=== Stage 1 (4h only) - ranking por Test AvgR @ RR="
+          f"{RANK_RR} | RankSetup={RANK_SETUP} (min test trades={MIN_TRADES_FOR_RANK_TEST}) ===")
+    print(tabulate(stage1, headers="keys", tablefmt="grid", showindex=False))
+
+    with open(f"results/only4h_summary_{SYMBOL}.md", "w", encoding="utf-8") as f:
+        f.write(f"# Only 4H Summary - {SYMBOL}\n\n")
+        f.write("- Trades: somente 4h\n")
+        f.write(f"- HTF: somente se 1D nativo baixar separado (available={htf_available})\n")
+        f.write(f"- SETUPS={SETUPS}\n")
+        f.write(f"- RANK_SETUP={RANK_SETUP} | RANK_RR={RANK_RR}\n")
+        f.write(f"- Train fraction: {TRAIN_FRACTION}\n")
+        f.write(f"- Time exit bars (4h): {TIME_EXIT_BARS}\n")
+        f.write(f"- Break-even fraction of target: {BE_TARGET_FRACTION}\n")
+        f.write(f"- HTF require slope: {HTF_REQUIRE_SLOPE}\n")
+        f.write(f"- Note: configs have _c10{{0|1}} for close>sma10 gating on classics/HTF.\n\n")
+        f.write("## Stage 1 (Structural)\n\n")
+        f.write(tabulate(stage1, headers="keys", tablefmt="pipe", showindex=False))
+
+
+if __name__ == "__main__":
+    main()
