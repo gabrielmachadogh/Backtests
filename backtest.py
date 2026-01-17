@@ -9,7 +9,6 @@ BASE_URL = os.getenv("MEXC_CONTRACT_BASE_URL", "https://contract.mexc.com/api/v1
 SYMBOL = os.getenv("SYMBOL", "BTC_USDT")
 
 TIMEFRAMES = [x.strip().lower() for x in os.getenv("TIMEFRAMES", "1h,2h,4h,1d,1w").split(",") if x.strip()]
-# Adicionando novos setups
 SETUPS = [x.strip().upper() for x in os.getenv("SETUPS", "PFR,DL,8.2,8.3").split(",") if x.strip()]
 
 SMA_SHORT = int(os.getenv("SMA_SHORT", "8"))
@@ -23,7 +22,7 @@ EXTREME_LOOKBACK = 20
 
 RRS = [float(x) for x in os.getenv("RRS", "1,1.5,2").split(",")]
 AMBIGUOUS_POLICY = os.getenv("AMBIGUOUS_POLICY", "loss").lower()
-MAX_ENTRY_WAIT_BARS = int(os.getenv("MAX_ENTRY_WAIT_BARS", "3")) # Aumentei para 3 para permitir o deslocamento do 8.2/8.3
+MAX_ENTRY_WAIT_BARS = int(os.getenv("MAX_ENTRY_WAIT_BARS", "3"))
 MAX_HOLD_BARS = 50
 
 MAX_BARS_1H = int(os.getenv("MAX_BARS_1H", "25000"))
@@ -32,14 +31,24 @@ TICK_SIZE = float(os.getenv("TICK_SIZE", "0"))
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
-# ... (Funções de Util, HTTP e Dados iguais ao anterior) ...
-# Vou omitir para economizar espaço, mantenha as funções fmt_pct, http_get_json, parse_kline, fetch_history, resample
+# --- UTIL ---
+def fmt_pct(val):
+    try:
+        if val is None or np.isnan(val): return "-"
+        return f"{val*100:.1f}%".replace(".", ",")
+    except: return "-"
 
-def to_datetime_auto(ts_series: pd.Series) -> pd.Series:
-    s = pd.to_numeric(ts_series, errors="coerce")
-    unit = "s" if s.dropna().median() < 1e12 else "ms"
-    return pd.to_datetime(s, unit=unit, utc=True)
+def http_get_json(url, params=None, tries=3):
+    for i in range(tries):
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            return r.json()
+        except:
+            time.sleep(1)
+    return None
 
+# --- DADOS ---
 def parse_kline(payload):
     if not payload: return pd.DataFrame()
     data = payload.get("data", []) or payload.get("result", [])
@@ -102,17 +111,14 @@ def add_indicators(df):
     x['sma_l'] = x['close'].rolling(SMA_LONG).mean()
     x['trend_up'] = (x['close'] > x['sma_s']) & (x['close'] > x['sma_l']) & (x['sma_s'] > x['sma_l'])
     
-    # Slope
     prev_max = x['sma_s'].shift(1).rolling(SLOPE_LOOKBACK).max()
     x['slope_up'] = x['sma_s'] > prev_max
     x['slope_strength'] = x['sma_s'] - prev_max
     
-    # ATR
     x['tr'] = np.maximum(x['high'] - x['low'], np.maximum(abs(x['high'] - x['close'].shift(1)), abs(x['low'] - x['close'].shift(1))))
     x['atr'] = x['tr'].rolling(ATR_PERIOD).mean()
     x['atr_pct'] = (x['atr'] / x['close']) * 100
     
-    # Stats
     x['range'] = x['high'] - x['low']
     x['body'] = abs(x['close'] - x['open'])
     x['lower_wick'] = np.minimum(x['open'], x['close']) - x['low']
@@ -120,14 +126,12 @@ def add_indicators(df):
     x['clv'] = (x['close'] - x['low']) / x['range']
     x['ret_5_pct'] = x['close'].pct_change(5) * 100
     
-    # RSI
     delta = x['close'].diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
     rs = up.rolling(RSI_PERIOD).mean() / down.rolling(RSI_PERIOD).mean()
     x['rsi'] = 100 - (100 / (1 + rs))
     
-    # Contexto Topo
     roll_hi = x['high'].rolling(EXTREME_LOOKBACK).max()
     x['is_new_high'] = x['high'] >= roll_hi
     x['grp_hi'] = x['is_new_high'].cumsum()
@@ -143,25 +147,16 @@ def add_indicators(df):
 
     return x
 
-# --- SINAIS ---
 def check_signals(x, i):
-    # PFR
     pfr = (x['low'].iloc[i] < x['low'].iloc[i-1]) and \
           (x['low'].iloc[i] < x['low'].iloc[i-2]) and \
           (x['close'].iloc[i] > x['close'].iloc[i-1])
           
-    # DL
     dl = (x['low'].iloc[i] < x['low'].iloc[i-1]) and \
          (x['low'].iloc[i] < x['low'].iloc[i-2])
          
-    # 8.2 (Fechou abaixo da mínima anterior)
-    # Requisito: Média subindo (já checado no main)
     setup_82 = x['close'].iloc[i] < x['low'].iloc[i-1]
     
-    # 8.3 (Fechou abaixo do ref i-2 duas vezes)
-    # Candle i é o segundo fechamento. i-1 foi o primeiro. i-2 é o ref.
-    # Regra: Fechamento i < Fechamento i-2 E Fechamento i-1 < Fechamento i-2
-    # E NÃO pode ter ativado 8.2 no candle anterior (Close i-1 >= Low i-2)
     setup_83 = (x['close'].iloc[i] < x['close'].iloc[i-2]) and \
                (x['close'].iloc[i-1] < x['close'].iloc[i-2]) and \
                (x['close'].iloc[i-1] >= x['low'].iloc[i-2]) 
@@ -176,7 +171,6 @@ def run_backtest(df, tf):
     start_idx = max(SMA_LONG, 50)
     
     for i in range(start_idx, len(x) - MAX_ENTRY_WAIT_BARS - 5):
-        # Filtro de Regime Básico (Tendência Alta + Média 8 subindo)
         if not (x['trend_up'].iloc[i] and x['slope_up'].iloc[i]):
             continue
             
@@ -191,46 +185,34 @@ def run_backtest(df, tf):
         if not active_setups: continue
         
         for setup in active_setups:
-            # Lógica de Entrada com Deslocamento (Trailing Entry)
-            # Para PFR/DL é fixo no candle i. Para 8.2/8.3 a máxima vai caindo.
-            
-            trigger_idx = i
             entry_price = x['high'].iloc[i] + tick
-            stop_price = x['low'].iloc[i] - tick # Stop inicial na mínima do sinal
+            stop_price = x['low'].iloc[i] - tick
             
             filled = False
             fill_idx = -1
             
-            # Tenta preencher nos próximos N candles
+            # Trailing Entry para 8.2 e 8.3
             for w in range(1, MAX_ENTRY_WAIT_BARS + 1):
                 curr_idx = i + w
+                if curr_idx >= len(x): break
                 curr_bar = x.iloc[curr_idx]
                 
-                # Se rompeu a máxima marcada
                 if curr_bar['high'] >= entry_price:
                     filled = True
                     fill_idx = curr_idx
                     break
                 
-                # Se não rompeu:
-                # Para 8.2/8.3: Se fez nova máxima menor, abaixa a entrada
-                # Para PFR/DL: Mantém a entrada original (ou cancela se MAX_WAIT=1)
                 if setup in ['8.2', '8.3']:
-                    # Regra de condução: Média tem que continuar subindo
-                    if not x['slope_up'].iloc[curr_idx]: 
-                        break # Aborta se média virou
-                        
-                    # Se candle atual tem máxima menor, move a entrada pra ela
+                    if not x['slope_up'].iloc[curr_idx]: break
                     if curr_bar['high'] < (entry_price - tick):
                         entry_price = curr_bar['high'] + tick
-                        # Opcional: Mover stop também? Geralmente mantém o original ou move pra nova mínima.
-                        # Larry W. mantém stop na mínima que originou o trade ou na mínima do gatilho.
-                        # Vamos manter stop na mínima do candle que serviu de gatilho final.
                         stop_price = min(stop_price, curr_bar['low'] - tick)
+                else:
+                    # PFR/DL só espera 1 candle (regra antiga)
+                    if w >= 1: break
                 
             if not filled: continue
             
-            # Executou!
             feat = {
                 'timeframe': tf, 'setup': setup,
                 'slope_strength': x['slope_strength'].iloc[i],
@@ -257,110 +239,4 @@ def run_backtest(df, tf):
                     
                     if hit_stop and hit_target:
                         outcome = AMBIGUOUS_POLICY
-                        break
-                    elif hit_stop:
-                        outcome = 'loss'
-                        break
-                    elif hit_target:
-                        outcome = 'win'
-                        break
-                
-                feat[f"rr_{rr}"] = outcome
-            
-            trades.append(feat)
-            
-    return pd.DataFrame(trades)
-
-# --- REPORTING ---
-def analyze_buckets(trades_df):
-    if trades_df.empty: return pd.DataFrame()
-    features = [
-        'slope_strength', 'bars_since_new_high', 'pullback_from_new_high_pct',
-        'dist_to_sma80_pct', 'atr_pct', 'clv', 'lower_wick_pct', 
-        'pos_in_range_n', 'ret_5_pct', 'vol_z'
-    ]
-    report_rows = []
-    for rr in RRS:
-        rr_col = f"rr_{rr}"
-        df_clean = trades_df[trades_df[rr_col].isin(['win', 'loss'])].copy()
-        for (tf, setup), g in df_clean.groupby(['timeframe', 'setup']):
-            total = len(g)
-            if total < 30: continue
-            wins = (g[rr_col] == 'win').sum()
-            wr_base = wins / total
-            report_rows.append({
-                'TF': tf, 'Setup': setup, 'RR': rr, 
-                'Feature': 'ALL', 'Bucket': 'ALL',
-                'Trades': total, 'WinRate': wr_base,
-                'Thr_Lo': np.nan, 'Thr_Hi': np.nan
-            })
-            for feat in features:
-                try:
-                    q25 = g[feat].quantile(0.25)
-                    g_low = g[g[feat] <= q25]
-                    if len(g_low) >= 20:
-                        w_l = (g_low[rr_col] == 'win').sum()
-                        report_rows.append({
-                            'TF': tf, 'Setup': setup, 'RR': rr,
-                            'Feature': feat, 'Bucket': 'Low25',
-                            'Trades': len(g_low), 'WinRate': w_l/len(g_low),
-                            'Thr_Lo': np.nan, 'Thr_Hi': q25
-                        })
-                    q75 = g[feat].quantile(0.75)
-                    g_high = g[g[feat] >= q75]
-                    if len(g_high) >= 20:
-                        w_h = (g_high[rr_col] == 'win').sum()
-                        report_rows.append({
-                            'TF': tf, 'Setup': setup, 'RR': rr,
-                            'Feature': feat, 'Bucket': 'High25',
-                            'Trades': len(g_high), 'WinRate': w_h/len(g_high),
-                            'Thr_Lo': q75, 'Thr_Hi': np.nan
-                        })
-                except: pass
-    return pd.DataFrame(report_rows)
-
-def main():
-    print(f"--- Iniciando Backtest LONG ONLY para {SYMBOL} ---")
-    df_raw = fetch_history(SYMBOL, MAX_BARS_1H)
-    if df_raw.empty: return
-
-    all_trades = []
-    tf_map = {'1h': df_raw}
-    if '2h' in TIMEFRAMES: tf_map['2h'] = resample(df_raw, '2h')
-    if '4h' in TIMEFRAMES: tf_map['4h'] = resample(df_raw, '4h')
-    if '1d' in TIMEFRAMES: tf_map['1d'] = resample(df_raw, '1D')
-    if '1w' in TIMEFRAMES: tf_map['1w'] = resample(df_raw, 'W-SUN')
-    
-    for tf_name in TIMEFRAMES:
-        if tf_name not in tf_map: continue
-        print(f"Processando {tf_name}...")
-        df_tf = tf_map[tf_name]
-        trades = run_backtest(df_tf, tf_name)
-        all_trades.append(trades)
-        
-    final_df = pd.concat(all_trades, ignore_index=True)
-    if final_df.empty: return
-        
-    os.makedirs("results", exist_ok=True)
-    final_df.to_csv(f"results/backtest_trades_{SYMBOL}.csv", index=False)
-    
-    print("Analisando padrões...")
-    report = analyze_buckets(final_df)
-    diamonds = report[report['WinRate'] >= 0.60].sort_values('WinRate', ascending=False)
-    
-    report['WinRate'] = report['WinRate'].apply(fmt_pct)
-    diamonds['WinRate'] = diamonds['WinRate'].apply(fmt_pct)
-    
-    report.to_csv(f"results/full_report_{SYMBOL}.csv", index=False)
-    
-    with open(f"results/best_long_patterns_{SYMBOL}.md", "w") as f:
-        f.write(f"# Top Long Setups (Winrate > 60%) - {SYMBOL}\n\n")
-        try:
-            f.write(tabulate(diamonds, headers="keys", tablefmt="pipe", showindex=False))
-        except:
-            f.write(diamonds.to_string())
-        
-    print("Concluído.")
-
-if __name__ == "__main__":
-    main()
+                        
