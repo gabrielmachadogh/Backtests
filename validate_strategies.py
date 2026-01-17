@@ -13,7 +13,6 @@ SYMBOLS = [
     "LINK/USDT:USDT", "LTC/USDT:USDT"
 ]
 
-# OTIMIZAÇÃO: 200 dias é suficiente para validar estatística (~4800 candles 1h)
 DAYS_HISTORY = 200 
 
 SMA_SHORT = 8
@@ -27,56 +26,82 @@ def check_setups(row, tf):
     
     # Filtros Base
     if not (row['trend_up'] and row['slope_up']):
-        return s
+        # Se não for tendência de alta, checa tendência de baixa para os shorts
+        if not (row['trend_down'] and row['slope_down']):
+            return s
+
+    trend_up = row['trend_up'] and row['slope_up']
+    trend_down = row['trend_down'] and row['slope_down']
 
     # 1. "O Rejeitador" (2h PFR Long)
-    if tf == '2h' and row['setup_pfr_buy']:
-        # Threshold ajustado pelos seus dados recentes
+    if tf == '2h' and trend_up and row['setup_pfr_buy']:
         if row['lower_wick_pct'] >= 45.0:
-            s['1_Rejeitador_2h'] = {'rr': 1.0}
+            s['1_Rejeitador_2h'] = {'side': 'long', 'rr': 1.0}
 
     # 2. "O Rompedor" (1h DL Long)
-    if tf == '1h' and row['setup_dl_buy']:
+    if tf == '1h' and trend_up and row['setup_dl_buy']:
         if row['pos_in_range_n'] >= 0.90:
-            s['2_Rompedor_1h'] = {'rr': 1.0}
+            s['2_Rompedor_1h'] = {'side': 'long', 'rr': 1.0}
 
     # 3. "O Foguete" (1h PFR Long)
-    if tf == '1h' and row['setup_pfr_buy']:
+    if tf == '1h' and trend_up and row['setup_pfr_buy']:
         if row['ret_5_pct'] >= 1.0:
-            s['3_Foguete_1h'] = {'rr': 1.0}
+            s['3_Foguete_1h'] = {'side': 'long', 'rr': 1.0}
 
     # 4. "DL Volátil" (2h DL Long)
-    if tf == '2h' and row['setup_dl_buy']:
+    if tf == '2h' and trend_up and row['setup_dl_buy']:
         if row['vol_z'] >= 1.0:
-            s['4_DL_Volatil_2h'] = {'rr': 1.5}
+            s['4_DL_Volatil_2h'] = {'side': 'long', 'rr': 1.5}
 
     # 5. "PFR Pullback Raso" (1h PFR Long)
-    if tf == '1h' and row['setup_pfr_buy']:
+    if tf == '1h' and trend_up and row['setup_pfr_buy']:
         if row['pullback_from_high'] <= 2.0:
-            s['5_PFR_Pullback_1h'] = {'rr': 1.5}
+            s['5_PFR_Pullback_1h'] = {'side': 'long', 'rr': 1.5}
+
+    # 6. "PFR Sniper" (4h PFR Long)
+    if tf == '4h' and trend_up and row['setup_pfr_buy']:
+        if row['ma_gap_pct'] < 3.0: 
+            s['6_PFR_Sniper_4h'] = {'side': 'long', 'rr': 1.0}
+
+    # 7. "Queda Livre" (1h PFR Short)
+    if tf == '1h' and trend_down and row['setup_pfr_sell']:
+        if row['pullback_from_low'] <= 2.0:
+            s['7_QuedaLivre_Short_1h'] = {'side': 'short', 'rr': 1.0}
+
+    # 8. "Short Esticado" (1h DL Short)
+    if tf == '1h' and trend_down and row['setup_dl_sell']:
+        if row['pos_in_range_n'] <= 0.25:
+            s['8_ShortEsticado_1h'] = {'side': 'short', 'rr': 1.0}
+
+    # 9. "PFR Tendência" (1h PFR Long)
+    if tf == '1h' and trend_up and row['setup_pfr_buy']:
+        if row['bars_since_high'] <= 20:
+            s['9_PFR_Trend_1h'] = {'side': 'long', 'rr': 1.5}
+
+    # 10. "DL Correção" (4h DL Long)
+    if tf == '4h' and trend_up and row['setup_dl_buy']:
+        if row['upper_wick_pct'] < 20.0:
+            s['10_DL_Clean_4h'] = {'side': 'long', 'rr': 1.0}
 
     return s
 
 # ================= ENGINE =================
 
 def fetch_data_fast(symbol):
-    """Baixa apenas 1h e cria os outros TFs matematicamente"""
     ex = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     
-    # Data de inicio
     since = int((datetime.now() - timedelta(days=DAYS_HISTORY)).timestamp() * 1000)
     all_ohlcv = []
     
     print(f"   -> Baixando {symbol} (últimos {DAYS_HISTORY} dias)...")
     
-    # Paginação simples (máx 5 calls)
     for _ in range(10):
         try:
             ohlcv = ex.fetch_ohlcv(symbol, '1h', limit=1000, since=since)
             if not ohlcv: break
             all_ohlcv.extend(ohlcv)
             since = ohlcv[-1][0] + 1
-            if len(ohlcv) < 1000: break # Chegou no fim
+            if len(ohlcv) < 1000: break 
             time.sleep(0.2)
         except:
             break
@@ -88,10 +113,9 @@ def fetch_data_fast(symbol):
     return df.drop_duplicates('ts').sort_values('ts').reset_index(drop=True)
 
 def resample_data(df, rule):
-    """Transforma 1h em 2h, 4h, etc"""
     if rule == '1h': return df.copy()
     
-    mapping = {'2h': '2H', '4h': '4H', '1d': '1D'}
+    mapping = {'2h': '2h', '4h': '4h', '1d': '1d'} # Correção do warning (lowercase)
     if rule not in mapping: return df
     
     d = df.set_index('ts').resample(mapping[rule]).agg({
@@ -114,13 +138,13 @@ def prepare_indicators(df):
     
     # Slope
     prev_max = x['sma_s'].shift(1).rolling(SLOPE_LOOKBACK).max()
+    prev_min = x['sma_s'].shift(1).rolling(SLOPE_LOOKBACK).min()
     x['slope_up'] = x['sma_s'] > prev_max
-    x['slope_down'] = x['sma_s'] < x['sma_s'].shift(1).rolling(SLOPE_LOOKBACK).min()
+    x['slope_down'] = x['sma_s'] < prev_min # Correção lógica do slope down
 
     # Features
     x['range'] = x['high'] - x['low']
     x['lower_wick'] = np.minimum(x['open'], x['close']) - x['low']
-    # Evitar divisão por zero com numpy
     x['lower_wick_pct'] = np.where(x['range'] > 0, (x['lower_wick'] / x['range']) * 100, 0)
     
     x['upper_wick'] = x['high'] - np.maximum(x['open'], x['close'])
@@ -168,7 +192,6 @@ def prepare_indicators(df):
     return x
 
 def run_simulation(df, i, side, rr):
-    # Tick aproximado
     tick = df['close'].iloc[i] * 0.0001
     
     if side == 'long':
@@ -183,7 +206,6 @@ def run_simulation(df, i, side, rr):
     
     target = entry_trigger + (risk * rr) if side == 'long' else entry_trigger - (risk * rr)
     
-    # 1. Fill Check (MAX_WAIT = 1)
     if i + 1 >= len(df): return None
     next_c = df.iloc[i+1]
     
@@ -195,7 +217,6 @@ def run_simulation(df, i, side, rr):
         
     if not filled: return "no_fill"
     
-    # 2. Outcome Check
     for j in range(i+1, min(i+1+MAX_HOLD_BARS, len(df))):
         c = df.iloc[j]
         if side == 'long':
@@ -205,7 +226,7 @@ def run_simulation(df, i, side, rr):
             if c['high'] >= stop_price: return "loss"
             if c['low'] <= target: return "win"
             
-    return "loss" # Timeout
+    return "loss"
 
 def main():
     results = []
@@ -214,24 +235,20 @@ def main():
     for symbol in SYMBOLS:
         clean_sym = symbol.split(":")[0]
         
-        # 1. Baixa 1h
         df_1h = fetch_data_fast(clean_sym)
         if df_1h.empty or len(df_1h) < 200:
             continue
             
-        # 2. Gera 2h e 4h
         dfs = {
             '1h': prepare_indicators(df_1h),
             '2h': prepare_indicators(resample_data(df_1h, '2h')),
             '4h': prepare_indicators(resample_data(df_1h, '4h'))
         }
         
-        # 3. Scan
         for tf, df in dfs.items():
             if len(df) < 100: continue
             
-            # Loop rápido
-            # Convertemos para dicionários para iterar mais rápido que iterrows
+            # Convertendo para dicionário para acesso mais rápido na iteração
             records = df.to_dict('records')
             
             for i in range(100, len(records)-1):
@@ -239,7 +256,7 @@ def main():
                 active_setups = check_setups(row, tf)
                 
                 for name, params in active_setups.items():
-                    # Usa o dataframe original para simulação (acesso por indice)
+                    # Passamos o dataframe original para a simulação (precisa olhar o futuro)
                     res = run_simulation(df, i, params['side'], params['rr'])
                     if res in ['win', 'loss']:
                         results.append({
@@ -254,7 +271,6 @@ def main():
 
     df_res = pd.DataFrame(results)
     
-    # Formatação da tabela
     def agg_fmt(x):
         total = len(x)
         wins = (x == 'win').sum()
@@ -266,7 +282,6 @@ def main():
     total_stats = df_res.groupby('Setup')['Outcome'].apply(lambda x: f"{100 * (x == 'win').sum() / len(x):.1f}% ({len(x)})")
     pivot['ALL_COINS'] = total_stats
 
-    # Ordenar por nome do setup
     pivot = pivot.sort_index()
 
     print("\n=== RESULTADO ===")
