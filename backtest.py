@@ -4,6 +4,7 @@ import requests
 import numpy as np
 import pandas as pd
 from tabulate import tabulate
+from itertools import product
 
 # =============================
 # CONFIG (env-friendly)
@@ -25,14 +26,6 @@ WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", "30"))
 
 SAVE_OHLCV = os.getenv("SAVE_OHLCV", "1") == "1"
 
-# ----- ATR -----
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-ATR_RISK_MIN = float(os.getenv("ATR_RISK_MIN", "0.6"))  # risk/ATR mínimo
-ATR_RISK_MAX = float(os.getenv("ATR_RISK_MAX", "3.0"))  # risk/ATR máximo
-
-# ----- Stretch (preço esticado) -----
-MAX_DIST_SMA_L_PCT = float(os.getenv("MAX_DIST_SMA_L_PCT", "0.06"))  # 6%
-
 # ----- HTF alignment -----
 HTF_REQUIRE_SLOPE = os.getenv("HTF_REQUIRE_SLOPE", "1") == "1"
 HTF_MAP = {
@@ -45,14 +38,31 @@ HTF_MAP = {
 
 # ----- Exits -----
 TIME_EXIT_BARS = int(os.getenv("TIME_EXIT_BARS", "50"))  # N candles
-BE_TRIGGER_R = float(os.getenv("BE_TRIGGER_R", "0.8"))   # +0.8R move stop p/ entrada
+BE_TARGET_FRACTION = float(os.getenv("BE_TARGET_FRACTION", "0.70"))  # 70% do caminho até o alvo
 
-# ----- Experimentos (A/B) -----
-EXPERIMENTS = [x.strip() for x in os.getenv(
-    "EXPERIMENTS",
-    "base,atr,stretch,htf,timeexit,breakeven,all"
-).split(",") if x.strip()]
+# ----- Stretch sweep (distâncias em % do preço) -----
+# Você pode ajustar essas listas no workflow:
+# DIST_SMA8_MAX_LIST="0.02,0.03"
+# DIST_SMA80_MAX_LIST="0.05,0.07"
+# SMA_GAP_MIN_LIST="0.0,0.01"
+DIST_SMA8_MAX_LIST = [float(x) for x in os.getenv("DIST_SMA8_MAX_LIST", "0.02,0.03").split(",")]
+DIST_SMA80_MAX_LIST = [float(x) for x in os.getenv("DIST_SMA80_MAX_LIST", "0.05,0.07").split(",")]
+SMA_GAP_MIN_LIST = [float(x) for x in os.getenv("SMA_GAP_MIN_LIST", "0.0,0.01").split(",")]
 
+SWEEP_STRETCH = os.getenv("SWEEP_STRETCH", "1") == "1"
+
+# Limite de configs (pra não explodir runtime sem querer)
+MAX_CONFIGS = int(os.getenv("MAX_CONFIGS", "200"))
+
+# =============================
+# HELPERS
+# =============================
+def pct_tag(x: float) -> str:
+    # 0.02 -> "2p0"
+    return f"{x*100:.1f}".replace(".", "p")
+
+def rr_tag(rr: float) -> str:
+    return str(rr)
 
 # =============================
 # HTTP / DATA
@@ -76,13 +86,6 @@ def http_get_json(url, params=None, tries=3, sleep_s=1.0):
 
 
 def parse_kline(payload):
-    """
-    Suporta:
-      - payload["data"] como dict de listas (comum na MEXC)
-      - payload["data"] como lista de listas
-      - payload["data"] como lista de dicts
-    Retorna DF com colunas: ts, open, high, low, close, volume
-    """
     if not payload or not isinstance(payload, dict):
         return pd.DataFrame()
 
@@ -140,7 +143,7 @@ def fetch_history(symbol):
     step = WINDOW_DAYS * 86400
 
     total = 0
-    for n in range(80):  # limite de segurança
+    for n in range(80):
         if total >= MAX_BARS_FETCH:
             break
 
@@ -185,8 +188,7 @@ def resample(df, rule):
     if rule == "1h":
         return df.copy()
 
-    # "1W" fecha por padrão no DOMINGO (W-SUN). Se quiser segunda, use "W-MON".
-    mapping = {"2h": "2H", "4h": "4H", "1d": "1D", "1w": "1W"}
+    mapping = {"2h": "2H", "4h": "4H", "1d": "1D", "1w": "1W"}  # W-SUN
     if rule not in mapping:
         return df
 
@@ -199,18 +201,6 @@ def resample(df, rule):
 # =============================
 # INDICATORS
 # =============================
-def add_atr(df, period=14):
-    x = df.copy()
-    prev_close = x["close"].shift(1)
-    tr = pd.concat([
-        (x["high"] - x["low"]),
-        (x["high"] - prev_close).abs(),
-        (x["low"] - prev_close).abs()
-    ], axis=1).max(axis=1)
-    x["atr"] = tr.rolling(period).mean()
-    return x
-
-
 def add_indicators(df):
     x = df.copy()
     x["sma_s"] = x["close"].rolling(SMA_SHORT).mean()
@@ -220,11 +210,10 @@ def add_indicators(df):
     x["trend_up"] = (x["close"] > x["sma_s"]) & (x["close"] > x["sma_l"]) & (x["sma_s"] > x["sma_l"])
     x["slope_up"] = x["sma_s"] > x["sma_s"].shift(1).rolling(SLOPE_LOOKBACK).max()
 
-    # Distância (%)
-    x["dist_sma_l"] = (x["close"] - x["sma_l"]) / x["close"]
-
-    # ATR
-    x = add_atr(x, ATR_PERIOD)
+    # Distâncias (% do preço)
+    x["dist_sma8"] = (x["close"] - x["sma_s"]) / x["close"]
+    x["dist_sma80"] = (x["close"] - x["sma_l"]) / x["close"]
+    x["sma_gap"] = (x["sma_s"] - x["sma_l"]) / x["close"]
 
     return x
 
@@ -253,7 +242,6 @@ def check_signals(x, i):
 # =============================
 def simulate_trade_per_rr(x, fill_idx, entry, initial_stop, rr, cfg):
     """
-    Simula a partir do candle fill_idx inclusive.
     Retorna:
       hit_target (bool), exit_type (str), r_result (float), exit_ts (Timestamp)
     """
@@ -263,31 +251,37 @@ def simulate_trade_per_rr(x, fill_idx, entry, initial_stop, rr, cfg):
 
     stop = initial_stop
     target = entry + (risk * rr)
-    be_trigger = entry + (risk * BE_TRIGGER_R)
 
-    be_moved = False
+    # Break-even: 70% do caminho até o alvo (depende do RR)
+    be_trigger = entry + (target - entry) * BE_TARGET_FRACTION  # entry + risk*rr*0.7
+    be_pending = False
+    be_active = False
 
-    # proteção
     n_bars = max(int(TIME_EXIT_BARS), 1)
     last_idx = min(fill_idx + n_bars - 1, len(x) - 1)
 
     for k in range(fill_idx, last_idx + 1):
         c = x.iloc[k]
 
-        # Assunção conservadora intrabar:
+        # Aplica BE somente a partir do candle seguinte ao trigger (evita ambiguidade intrabar)
+        if cfg["use_breakeven"] and be_pending and not be_active:
+            stop = entry
+            be_active = True
+            be_pending = False
+
+        # Ordem conservadora intrabar:
         # 1) stop
         # 2) target
-        # 3) break-even trigger (move stop)
+        # 3) trigger do BE (para ativar no próximo candle)
         if c["low"] <= stop:
             r = (stop - entry) / risk  # -1.0 ou 0.0 (se stop virou entry)
-            return False, "stop", float(r), c["ts"]
+            return False, "stop" if stop < entry else "breakeven_stop", float(r), c["ts"]
 
         if c["high"] >= target:
             return True, "target", float(rr), c["ts"]
 
-        if cfg["use_breakeven"] and (not be_moved) and (c["high"] >= be_trigger):
-            stop = entry
-            be_moved = True
+        if cfg["use_breakeven"] and (not be_active) and (c["high"] >= be_trigger):
+            be_pending = True
 
     # Não bateu stop/target dentro de N candles
     if cfg["use_time_exit"]:
@@ -295,7 +289,7 @@ def simulate_trade_per_rr(x, fill_idx, entry, initial_stop, rr, cfg):
         r = (exit_px - entry) / risk
         return False, "time_exit", float(r), x["ts"].iloc[last_idx]
 
-    # comportamento antigo: vira loss
+    # comportamento antigo: vira loss (comparável ao seu base)
     return False, "timeout_loss", -1.0, x["ts"].iloc[last_idx]
 
 
@@ -303,17 +297,13 @@ def simulate_trade_per_rr(x, fill_idx, entry, initial_stop, rr, cfg):
 # BACKTEST CORE
 # =============================
 def run_backtest(df_tf, tf, cfg, htf_flags=None):
-    """
-    cfg: dict com toggles (atr/stretch/htf/time_exit/breakeven)
-    htf_flags: DF com colunas ['ts','htf_trend_up','htf_slope_up'] para merge_asof (ou None)
-    """
     x = add_indicators(df_tf).copy()
     if x.empty or len(x) < (SMA_LONG + 30):
         return pd.DataFrame()
 
     x = x.sort_values("ts").reset_index(drop=True)
 
-    # Junta flags do HTF (se houver)
+    # HTF merge
     if cfg["use_htf"] and htf_flags is not None and not htf_flags.empty:
         tmp = pd.merge_asof(
             x[["ts"]],
@@ -328,12 +318,12 @@ def run_backtest(df_tf, tf, cfg, htf_flags=None):
         x["htf_slope_up"] = True
 
     tick = float(x["close"].iloc[-1] * 0.0001)
+    start_idx = max(SMA_LONG + 20, SLOPE_LOOKBACK + 5)
 
-    start_idx = max(SMA_LONG + 20, ATR_PERIOD + 5, SLOPE_LOOKBACK + 5)
     trades = []
 
     for i in range(start_idx, len(x) - 10):
-        # Regime base (já existia)
+        # Regime base
         if not (x["trend_up"].iloc[i] and x["slope_up"].iloc[i]):
             continue
 
@@ -344,10 +334,22 @@ def run_backtest(df_tf, tf, cfg, htf_flags=None):
             if HTF_REQUIRE_SLOPE and (not x["htf_slope_up"].iloc[i]):
                 continue
 
-        # Stretch filter
+        # Stretch filters (sweep)
         if cfg["use_stretch"]:
-            dist_l = x["dist_sma_l"].iloc[i]
-            if np.isnan(dist_l) or (dist_l > MAX_DIST_SMA_L_PCT):
+            dist8 = x["dist_sma8"].iloc[i]
+            dist80 = x["dist_sma80"].iloc[i]
+            gap = x["sma_gap"].iloc[i]
+
+            if np.isnan(dist8) or np.isnan(dist80) or np.isnan(gap):
+                continue
+
+            # Como trend_up exige close > sma, dist tende a ser positivo;
+            # regra é: "não operar se estiver esticado acima de X%"
+            if dist8 > cfg["dist_sma8_max"]:
+                continue
+            if dist80 > cfg["dist_sma80_max"]:
+                continue
+            if gap < cfg["sma_gap_min"]:
                 continue
 
         pfr, dl, s82, s83 = check_signals(x, i)
@@ -396,16 +398,9 @@ def run_backtest(df_tf, tf, cfg, htf_flags=None):
             if not filled:
                 continue
 
-            # ATR filter (após entry/stop definitivos)
             risk = entry - stop
-            atr_val = float(x["atr"].iloc[fill_idx]) if not np.isnan(x["atr"].iloc[fill_idx]) else np.nan
-            risk_in_atr = (risk / atr_val) if (atr_val and not np.isnan(atr_val) and atr_val > 0) else np.nan
-
-            if cfg["use_atr"]:
-                if np.isnan(risk_in_atr):
-                    continue
-                if not (ATR_RISK_MIN <= risk_in_atr <= ATR_RISK_MAX):
-                    continue
+            if risk <= 0 or np.isnan(risk):
+                continue
 
             base_row = {
                 "config": cfg["name"],
@@ -419,16 +414,18 @@ def run_backtest(df_tf, tf, cfg, htf_flags=None):
                 "stop": stop,
                 "risk": risk,
 
-                "atr": atr_val,
-                "risk_in_atr": risk_in_atr,
+                "dist_sma8": float(x["dist_sma8"].iloc[i]),
+                "dist_sma80": float(x["dist_sma80"].iloc[i]),
+                "sma_gap": float(x["sma_gap"].iloc[i]),
 
-                "dist_sma_l": float(x["dist_sma_l"].iloc[i]) if not np.isnan(x["dist_sma_l"].iloc[i]) else np.nan,
-
-                "use_atr": cfg["use_atr"],
-                "use_stretch": cfg["use_stretch"],
                 "use_htf": cfg["use_htf"],
                 "use_time_exit": cfg["use_time_exit"],
                 "use_breakeven": cfg["use_breakeven"],
+                "use_stretch": cfg["use_stretch"],
+
+                "dist_sma8_max": cfg.get("dist_sma8_max", np.nan),
+                "dist_sma80_max": cfg.get("dist_sma80_max", np.nan),
+                "sma_gap_min": cfg.get("sma_gap_min", np.nan),
             }
 
             for rr in RRS:
@@ -440,10 +437,10 @@ def run_backtest(df_tf, tf, cfg, htf_flags=None):
                     rr=rr,
                     cfg=cfg
                 )
-                base_row[f"hit_{rr}"] = bool(hit)
-                base_row[f"exit_type_{rr}"] = exit_type
-                base_row[f"R_{rr}"] = r_res
-                base_row[f"exit_ts_{rr}"] = exit_ts
+                base_row[f"hit_{rr_tag(rr)}"] = bool(hit)
+                base_row[f"exit_type_{rr_tag(rr)}"] = exit_type
+                base_row[f"R_{rr_tag(rr)}"] = r_res
+                base_row[f"exit_ts_{rr_tag(rr)}"] = exit_ts
 
             trades.append(base_row)
 
@@ -451,27 +448,58 @@ def run_backtest(df_tf, tf, cfg, htf_flags=None):
 
 
 # =============================
-# EXPERIMENT SETUP
+# EXPERIMENTS (A/B + sweep)
 # =============================
 def build_experiments():
-    presets = {
-        "base":      dict(use_atr=False, use_stretch=False, use_htf=False, use_time_exit=False, use_breakeven=False),
-        "atr":       dict(use_atr=True,  use_stretch=False, use_htf=False, use_time_exit=False, use_breakeven=False),
-        "stretch":   dict(use_atr=False, use_stretch=True,  use_htf=False, use_time_exit=False, use_breakeven=False),
-        "htf":       dict(use_atr=False, use_stretch=False, use_htf=True,  use_time_exit=False, use_breakeven=False),
-        "timeexit":  dict(use_atr=False, use_stretch=False, use_htf=False, use_time_exit=True,  use_breakeven=False),
-        "breakeven": dict(use_atr=False, use_stretch=False, use_htf=False, use_time_exit=False, use_breakeven=True),
-        "all":       dict(use_atr=True,  use_stretch=True,  use_htf=True,  use_time_exit=True,  use_breakeven=True),
-    }
+    """
+    Variáveis ON/OFF:
+      - HTF
+      - TIME EXIT
+      - BREAK EVEN
+    Stretch:
+      - OFF (baseline)
+      - ON com sweep de (dist_sma8_max, dist_sma80_max, sma_gap_min)
+    """
+    scenarios = []
+    for use_htf, use_time_exit, use_breakeven in product([False, True], repeat=3):
+        base_name = f"htf{int(use_htf)}_tx{int(use_time_exit)}_be{int(use_breakeven)}"
+        scenarios.append({
+            "name": base_name,
+            "use_htf": use_htf,
+            "use_time_exit": use_time_exit,
+            "use_breakeven": use_breakeven,
+            "use_stretch": False,
+        })
 
-    exps = []
-    for name in EXPERIMENTS:
-        if name not in presets:
-            continue
-        cfg = {"name": name}
-        cfg.update(presets[name])
-        exps.append(cfg)
-    return exps
+    configs = []
+
+    # Sempre inclui stretch OFF
+    configs.extend(scenarios)
+
+    # Stretch ON (sweep)
+    if SWEEP_STRETCH:
+        for sc in scenarios:
+            for s8, s80, gap in product(DIST_SMA8_MAX_LIST, DIST_SMA80_MAX_LIST, SMA_GAP_MIN_LIST):
+                name = (
+                    f"{sc['name']}_st1"
+                    f"_s8{pct_tag(s8)}"
+                    f"_s80{pct_tag(s80)}"
+                    f"_gap{pct_tag(gap)}"
+                )
+                cfg = dict(sc)
+                cfg["name"] = name
+                cfg["use_stretch"] = True
+                cfg["dist_sma8_max"] = float(s8)
+                cfg["dist_sma80_max"] = float(s80)
+                cfg["sma_gap_min"] = float(gap)
+                configs.append(cfg)
+
+    # Cap de segurança
+    if len(configs) > MAX_CONFIGS:
+        print(f"Aviso: configs={len(configs)} > MAX_CONFIGS={MAX_CONFIGS}. Cortando lista.")
+        configs = configs[:MAX_CONFIGS]
+
+    return configs
 
 
 def summarize(trades_df):
@@ -482,10 +510,11 @@ def summarize(trades_df):
     for (cfg, tf, setup), g in trades_df.groupby(["config", "timeframe", "setup"]):
         row = {"Config": cfg, "TF": tf, "Setup": setup, "Trades": len(g)}
         for rr in RRS:
-            hit_rate = g[f"hit_{rr}"].mean() if len(g) else 0.0
-            avg_r = g[f"R_{rr}"].mean() if len(g) else np.nan  # <-- AQUI estava quebrado no seu arquivo
-            row[f"WR {rr}"] = f"{hit_rate:.1%}"
-            row[f"AvgR {rr}"] = f"{avg_r:.2f}"
+            k = rr_tag(rr)
+            hit_rate = g[f"hit_{k}"].mean() if len(g) else 0.0
+            avg_r = g[f"R_{k}"].mean() if len(g) else np.nan
+            row[f"WR {k}"] = f"{hit_rate:.1%}"
+            row[f"AvgR {k}"] = f"{avg_r:.2f}"
         rows.append(row)
 
     return pd.DataFrame(rows).sort_values(["Config", "TF", "Setup"])
@@ -500,24 +529,23 @@ def main():
     df_raw = fetch_history(SYMBOL)
     if df_raw.empty:
         print("Erro: Sem dados baixados.")
-        pd.DataFrame({"status": ["no_data"]}).to_csv(f"results/experiments_trades_{SYMBOL}.csv", index=False)
+        pd.DataFrame({"status": ["no_data"]}).to_csv(f"results/sweep_trades_{SYMBOL}.csv", index=False)
         return
 
-    # Constrói OHLCV por timeframe
+    # OHLCV por timeframe
     tf_dfs = {"1h": df_raw.copy()}
     for tf in TIMEFRAMES:
         if tf == "1h":
             continue
         tf_dfs[tf] = resample(df_raw, tf)
 
-    # Salva OHLCV (opcional)
     if SAVE_OHLCV:
         for tf, d in tf_dfs.items():
             if d is None or d.empty:
                 continue
             d.to_csv(f"results/ohlcv_{SYMBOL}_{tf}.csv", index=False)
 
-    # Pré-calcula indicadores nos HTFs (para alinhar)
+    # Indicadores nos HTFs (para merge_asof)
     tf_ind = {}
     for tf, d in tf_dfs.items():
         if d is None or d.empty:
@@ -525,20 +553,20 @@ def main():
         else:
             tf_ind[tf] = add_indicators(d).sort_values("ts").reset_index(drop=True)
 
-    experiments = build_experiments()
-    if not experiments:
-        print("Nenhum experimento configurado (EXPERIMENTS vazio?).")
-        return
+    configs = build_experiments()
+    print(f"Total de configs: {len(configs)} (SWEEP_STRETCH={SWEEP_STRETCH})")
 
     all_trades = []
-    for cfg in experiments:
-        print(f"\n=== Experimento: {cfg['name']} ===")
+    for cfg in configs:
+        if DEBUG:
+            print(f"\n=== Config: {cfg['name']} ===")
+
         for tf in TIMEFRAMES:
             df_tf = tf_dfs.get(tf, pd.DataFrame())
             if df_tf is None or df_tf.empty or len(df_tf) < 120:
                 continue
 
-            # HTF flags (se habilitado)
+            # HTF flags
             htf_tf = HTF_MAP.get(tf)
             htf_flags = None
             if cfg["use_htf"] and htf_tf:
@@ -550,7 +578,6 @@ def main():
                         "slope_up": "htf_slope_up",
                     })
 
-            print(f"Rodando TF={tf} (HTF={htf_tf if cfg['use_htf'] else 'OFF'}) ...")
             try:
                 t = run_backtest(df_tf=df_tf, tf=tf, cfg=cfg, htf_flags=htf_flags)
                 if not t.empty:
@@ -559,34 +586,36 @@ def main():
                 print(f"Erro em {cfg['name']} / {tf}: {e}")
 
     if not all_trades:
-        print("0 trades gerados em todos os experimentos.")
-        pd.DataFrame({"status": ["no_trades"]}).to_csv(f"results/experiments_trades_{SYMBOL}.csv", index=False)
+        print("0 trades gerados.")
+        pd.DataFrame({"status": ["no_trades"]}).to_csv(f"results/sweep_trades_{SYMBOL}.csv", index=False)
         return
 
     final = pd.concat(all_trades, ignore_index=True)
 
-    # CSV completo (tudo junto)
-    final.to_csv(f"results/experiments_trades_{SYMBOL}.csv", index=False)
+    # CSV completo
+    final.to_csv(f"results/sweep_trades_{SYMBOL}.csv", index=False)
 
-    # CSV por experimento
+    # CSV por config (facilita comparar)
     for cfg_name, g in final.groupby("config"):
-        g.to_csv(f"results/experiments_trades_{SYMBOL}_{cfg_name}.csv", index=False)
+        g.to_csv(f"results/sweep_trades_{SYMBOL}_{cfg_name}.csv", index=False)
 
     # Resumo
     sum_df = summarize(final)
     print("\n" + tabulate(sum_df, headers="keys", tablefmt="grid", showindex=False))
 
-    with open(f"results/experiments_summary_{SYMBOL}.md", "w", encoding="utf-8") as f:
-        f.write(f"# Experiments Summary - {SYMBOL}\n\n")
-        f.write("Config flags:\n\n")
-        f.write(f"- ATR: period={ATR_PERIOD}, risk/ATR in [{ATR_RISK_MIN}, {ATR_RISK_MAX}]\n")
-        f.write(f"- Stretch: dist_sma_l <= {MAX_DIST_SMA_L_PCT:.2%}\n")
-        f.write(f"- HTF: map={HTF_MAP}, require_slope={HTF_REQUIRE_SLOPE}\n")
-        f.write(f"- Time exit: N={TIME_EXIT_BARS}\n")
-        f.write(f"- Break-even: trigger={BE_TRIGGER_R}R\n\n")
+    with open(f"results/sweep_summary_{SYMBOL}.md", "w", encoding="utf-8") as f:
+        f.write(f"# Sweep Summary - {SYMBOL}\n\n")
+        f.write("Params:\n\n")
+        f.write(f"- TIME_EXIT_BARS={TIME_EXIT_BARS}\n")
+        f.write(f"- BE_TARGET_FRACTION={BE_TARGET_FRACTION}\n")
+        f.write(f"- SWEEP_STRETCH={SWEEP_STRETCH}\n")
+        f.write(f"- DIST_SMA8_MAX_LIST={DIST_SMA8_MAX_LIST}\n")
+        f.write(f"- DIST_SMA80_MAX_LIST={DIST_SMA80_MAX_LIST}\n")
+        f.write(f"- SMA_GAP_MIN_LIST={SMA_GAP_MIN_LIST}\n")
+        f.write(f"- HTF_MAP={HTF_MAP}, require_slope={HTF_REQUIRE_SLOPE}\n\n")
         f.write(tabulate(sum_df, headers="keys", tablefmt="pipe", showindex=False))
 
-    sum_df.to_csv(f"results/experiments_summary_{SYMBOL}.csv", index=False)
+    sum_df.to_csv(f"results/sweep_summary_{SYMBOL}.csv", index=False)
 
 
 if __name__ == "__main__":
