@@ -1,19 +1,91 @@
-      - name: Commit Results
+name: backtest-long-only
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+
+    env:
+      SYMBOL: BTC_USDT
+      TIMEFRAMES: 1h,2h,4h,1d
+      # Lista completa dos setups atuais
+      SETUPS: PFR,DL,8.2,8.3
+      
+      # Parâmetros Técnicos
+      SMA_SHORT: "8"
+      SMA_LONG: "80"
+      SLOPE_LOOKBACK: "8"
+      ATR_PERIOD: "14"
+      RSI_PERIOD: "14"
+      LOOKBACK_N: "20"
+      EXTREME_LOOKBACK: "20"
+      
+      # Regras de Execução
+      # Definido em 3 para permitir que setups 8.2/8.3 desloquem a entrada
+      # (O script Python controla para PFR/DL serem mais rígidos se necessário)
+      MAX_ENTRY_WAIT_BARS: "3" 
+      MAX_HOLD_BARS: "50"
+      AMBIGUOUS_POLICY: loss
+      
+      # Histórico (25k candles para pegar bastante base)
+      MAX_BARS_1H: "25000"
+      WINDOW_DAYS: "30"
+      TICK_SIZE: "0"
+      
+      # Risco Retorno
+      RRS: "1,1.5,2"
+      
+      # Debug ativado para ver logs detalhados
+      DEBUG: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pandas numpy requests tabulate
+
+      - name: Run Backtest Script
+        run: python backtest.py
+
+      - name: Commit and Push Results
         run: |
+          # Configura o usuário do bot
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           
-          # Tenta baixar as ultimas mudanças para evitar conflito
+          # Garante que temos a versão mais recente para evitar conflitos
           git pull --rebase || true
           
-          # Força adição de tudo na pasta results
+          # Força a adição dos arquivos gerados na pasta results
           git add -f results/*
           
-          # Debug: Mostra o que vai ser commitado
+          # Debug: Mostra o status para sabermos o que mudou
           echo "Status do Git:"
           git status
           
-          # Commita e Pusha
-          git commit -m "New Backtest Run $(date +'%Y-%m-%d %H:%M')" || echo "Nada mudou, sem commit."
-          git push
+          # Faz o commit com data e hora para garantir unicidade
+          git commit -m "Backtest Results: $(date +'%Y-%m-%d %H:%M')" || echo "Nenhuma alteração detectada nos resultados."
           
+          # Envia para o repositório
+          git push
+
+      - name: Upload Artifacts (Backup)
+        if: always() # Roda mesmo se o passo anterior falhar
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results-${{ github.run_id }}
+          overwrite: true
+          path: results/**
