@@ -1,6 +1,7 @@
 # Scenario Summary - BTC_USDT
 
-- RR rank: 1.5
+- RRs: [1.0, 1.5, 2.0, 3.0]
+- Rank RR: 1.5
 - Train fraction: 0.7
 - Time exit bars (4h): 50
 - Break-even fraction of target: 0.7
