@@ -1,58 +1,19 @@
-name: backtest-long-only
-
-on:
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
-jobs:
-  backtest:
-    runs-on: ubuntu-latest
-
-    env:
-      SYMBOL: BTC_USDT
-      TIMEFRAMES: 1h,2h,4h,1d
-      SETUPS: PFR,DL,8.2,8.3
-      
-      # Parâmetros
-      SMA_SHORT: "8"
-      SMA_LONG: "80"
-      SLOPE_LOOKBACK: "8"
-      ATR_PERIOD: "14"
-      RSI_PERIOD: "14"
-      LOOKBACK_N: "20"
-      EXTREME_LOOKBACK: "20"
-      
-      # Regras de Execução
-      # Aumentado para 3 para permitir o "trailing entry" dos setups 8.2 e 8.3
-      MAX_ENTRY_WAIT_BARS: "3" 
-      MAX_HOLD_BARS: "50"
-      AMBIGUOUS_POLICY: loss
-      
-      # Histórico
-      MAX_BARS_1H: "25000"
-      WINDOW_DAYS: "30"
-      TICK_SIZE: "0"
-      
-      RRS: "1,1.5,2"
-      
-      # Debug
-      DEBUG: "0"
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: pip install pandas numpy requests tabulate
-      
-      - name: Run Backtest
-        run: python backtest.py
-        
       - name: Commit Results
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # Tenta baixar as ultimas mudanças para evitar conflito
           git pull --rebase || true
-          # Adiciona todos os arquivos da pasta results (csv e 
+          
+          # Força adição de tudo na pasta results
+          git add -f results/*
+          
+          # Debug: Mostra o que vai ser commitado
+          echo "Status do Git:"
+          git status
+          
+          # Commita e Pusha
+          git commit -m "New Backtest Run $(date +'%Y-%m-%d %H:%M')" || echo "Nada mudou, sem commit."
+          git push
+          
