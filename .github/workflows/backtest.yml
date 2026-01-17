@@ -1,4 +1,4 @@
-name: backtest-baseline
+name: pfr-4h-step4
 
 on:
   workflow_dispatch:
@@ -9,11 +9,32 @@ permissions:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     env:
-      SYMBOL: BTC_USDT
       DEBUG: "0"
+      SAVE_OHLCV: "1"
+
+      # --- STEP 4 ---
+      SYMBOLS: "BTC_USDT,ETH_USDT,SOL_USDT"
+      RRS: "1.0,1.5,2.0,3.0"
+      RANK_RR: "1.5"
+
+      # mais histórico
+      WINDOW_DAYS_4H: "365"
+      MAX_BARS_FETCH_4H: "40000"
+
+      # simulação
+      MAX_WAIT_FILL: "1"
+      MAX_HOLD_BARS: "50"
+      BE_TARGET_FRACTION: "0.70"
+
+      # split e elegibilidade
+      TRAIN_FRACTION: "0.70"
+      MIN_TRADES_FOR_RANK_TEST: "80"
+
+      # segurança
+      MAX_SYMBOLS: "50"
 
     steps:
       - uses: actions/checkout@v4
@@ -29,7 +50,7 @@ jobs:
       - run: pip install -U pip
       - run: pip install pandas numpy requests tabulate
 
-      - name: Run Baseline Backtest
+      - name: Run PFR 4H Step4
         run: python backtest.py
 
       - name: Commit Results
@@ -40,5 +61,5 @@ jobs:
           git add results/ || true
           git status
 
-          git commit -m "Baseline Results $(date -u +'%Y-%m-%d %H:%M UTC')" || echo "no changes"
+          git commit -m "PFR 4H Step4 Results $(date -u +'%Y-%m-%d %H:%M UTC')" || echo "no changes"
           git push
