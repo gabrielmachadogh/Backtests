@@ -9,23 +9,31 @@ from itertools import product
 # =========================================================
 # ONLY 4H TRADING + (OPTIONAL) HTF FILTER FROM NATIVE 1D DOWNLOAD
 #
-# Regras do usuário:
+# Regras:
 # - Trades APENAS no 4h.
 # - HTF só é permitido se vier de 1D BAIXADO SEPARADO (NÃO reamostrar do 4h).
 #   Se não houver 1D nativo disponível, configs com HTF são removidas.
 #
-# Testes (variáveis ON/OFF):
+# Variáveis ON/OFF testadas (configs):
 # - HTF (1D nativo) on/off
-# - Time-exit on/off (sai a mercado após N candles, calcula R real)
+# - Time-exit on/off (sai a mercado após N candles e calcula R real)
 # - Break-even on/off (aciona ao atingir 70% do alvo; efetivo no candle seguinte)
 #
-# Stretch sweep (aplicado como filtro em cima dos trades já gerados):
-# - dist_sma8_max, dist_sma80_max, sma_gap_min
+# Stretch sweep (filtro aplicado em cima dos trades já gerados):
+# - dist_sma8_max, dist_sma80_max, sma_gap_min   (permanece como antes)
 #
-# Validação "mais conclusiva":
-# - Split temporal TREINO/TESTE (global)
-# - Stage 1: escolhe melhor config estrutural (sem stretch)
+# NOVO SETUP:
+# - MA_LADDER: médias 10,15,20,25,30,35,40,45 com lógica stateful (armar/tocar/rolar gatilho)
+#
+# Validação "conclusiva":
+# - Split temporal TREINO/TESTE
+# - Stage 1: escolhe melhor config estrutural (sem stretch) pelo AvgR no TESTE
 # - Stage 2: escolhe melhor stretch no TREINO e valida no TESTE
+#
+# Dica importante:
+# - Para avaliar só o novo setup, rode com:
+#     SETUPS="MA_LADDER"
+#     RANK_SETUP="MA_LADDER"
 # =========================================================
 
 # =============================
@@ -37,9 +45,17 @@ DEBUG = os.getenv("DEBUG", "0") == "1"
 
 TRADING_TF = "4h"
 
+# Se você não setar, inclui tudo + o novo
+SETUPS = [s.strip() for s in os.getenv("SETUPS", "PFR,DL,8.2,8.3,MA_LADDER").split(",") if s.strip()]
+RANK_SETUP = os.getenv("RANK_SETUP", "ALL")  # "ALL" ou "MA_LADDER" ou "PFR" etc.
+
 SMA_SHORT = int(os.getenv("SMA_SHORT", "8"))
 SMA_LONG = int(os.getenv("SMA_LONG", "80"))
 SLOPE_LOOKBACK = int(os.getenv("SLOPE_LOOKBACK", "8"))
+
+# Ladder MAs
+LADDER_MAS = [10, 15, 20, 25, 30, 35, 40, 45]
+LADDER_DISARM_ON_CLOSE_BELOW = 40  # desarma se close < SMA40
 
 RRS = [float(x) for x in os.getenv("RRS", "1.0,1.5,2.0").split(",")]
 RANK_RR = float(os.getenv("RANK_RR", "1.5"))  # RR usado para ranking
@@ -59,7 +75,7 @@ SAVE_OHLCV = os.getenv("SAVE_OHLCV", "1") == "1"
 HTF_REQUIRE_SLOPE = os.getenv("HTF_REQUIRE_SLOPE", "1") == "1"
 
 # ----- Exits -----
-TIME_EXIT_BARS = int(os.getenv("TIME_EXIT_BARS", "50"))            # em candles de 4h
+TIME_EXIT_BARS = int(os.getenv("TIME_EXIT_BARS", "50"))              # em candles de 4h
 BE_TARGET_FRACTION = float(os.getenv("BE_TARGET_FRACTION", "0.70"))  # 70% do caminho até o alvo
 
 # ----- Stretch sweep (em % do SMA) -----
@@ -89,6 +105,14 @@ def rr_key(rr: float) -> str:
     if float(rr).is_integer():
         return str(int(rr))
     return str(rr)
+
+
+def filter_for_rank(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    if (RANK_SETUP or "").upper() == "ALL":
+        return df
+    return df[df["setup"] == RANK_SETUP].copy()
 
 
 # =============================
@@ -163,9 +187,6 @@ def parse_kline(payload):
 
 
 def fetch_history(symbol, interval_candidates, window_days, max_bars, label):
-    """
-    Baixa candles usando uma lista de possíveis 'interval' (MEXC às vezes muda).
-    """
     print(f"Baixando histórico {label} para {symbol}...")
 
     end_ts = int(time.time())
@@ -225,7 +246,6 @@ def fetch_history(symbol, interval_candidates, window_days, max_bars, label):
 
 
 def fetch_4h(symbol):
-    # mais comum: Hour4 ou Min240
     return fetch_history(
         symbol=symbol,
         interval_candidates=["Hour4", "Min240"],
@@ -236,7 +256,6 @@ def fetch_4h(symbol):
 
 
 def fetch_1d_native(symbol):
-    # em alguns ambientes: Day1 / Min1440
     return fetch_history(
         symbol=symbol,
         interval_candidates=["Day1", "Min1440"],
@@ -251,38 +270,126 @@ def fetch_1d_native(symbol):
 # =============================
 def add_indicators(df):
     x = df.copy()
+
+    # principais já existentes
     x["sma8"] = x["close"].rolling(SMA_SHORT).mean()
     x["sma80"] = x["close"].rolling(SMA_LONG).mean()
 
-    # regime long-only (como você já vinha usando)
     x["trend_up"] = (x["close"] > x["sma8"]) & (x["close"] > x["sma80"]) & (x["sma8"] > x["sma80"])
     x["slope_up"] = x["sma8"] > x["sma8"].shift(1).rolling(SLOPE_LOOKBACK).max()
 
-    # Stretch features (% do SMA)
+    # stretch features (% do SMA)
     x["dist_sma8"] = (x["close"] - x["sma8"]) / x["sma8"]
     x["dist_sma80"] = (x["close"] - x["sma80"]) / x["sma80"]
     x["sma_gap"] = (x["sma8"] - x["sma80"]) / x["sma80"]
+
+    # ladder SMAs
+    for p in LADDER_MAS:
+        x[f"sma{p}"] = x["close"].rolling(p).mean()
 
     return x
 
 
 # =============================
-# SETUPS
+# SETUPS (clássicos)
 # =============================
 def check_signals(x, i):
+    # PFR
     pfr = (
         (x["low"].iloc[i] < x["low"].iloc[i - 1])
         and (x["low"].iloc[i] < x["low"].iloc[i - 2])
         and (x["close"].iloc[i] > x["close"].iloc[i - 1])
     )
+    # DL
     dl = (x["low"].iloc[i] < x["low"].iloc[i - 1]) and (x["low"].iloc[i] < x["low"].iloc[i - 2])
+
+    # 8.2
     s82 = x["close"].iloc[i] < x["low"].iloc[i - 1]
+
+    # 8.3
     s83 = (
         (x["close"].iloc[i] < x["close"].iloc[i - 2])
         and (x["close"].iloc[i - 1] < x["close"].iloc[i - 2])
         and (x["close"].iloc[i - 1] >= x["low"].iloc[i - 2])
     )
     return pfr, dl, s82, s83
+
+
+# =============================
+# MA_LADDER helpers
+# =============================
+def ladder_armed_condition(x, i) -> bool:
+    """
+    Arma quando:
+      close > sma10
+      sma10 > sma15 > ... > sma45
+    """
+    try:
+        c = x["close"].iloc[i]
+        sma10 = x["sma10"].iloc[i]
+        if np.isnan(c) or np.isnan(sma10):
+            return False
+        if not (c > sma10):
+            return False
+
+        # strict ordering
+        for a, b in zip(LADDER_MAS[:-1], LADDER_MAS[1:]):
+            va = x[f"sma{a}"].iloc[i]
+            vb = x[f"sma{b}"].iloc[i]
+            if np.isnan(va) or np.isnan(vb):
+                return False
+            if not (va > vb):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def ladder_disarm_condition(x, i) -> bool:
+    """
+    Desarma se fechar abaixo da SMA40.
+    """
+    sma40 = x["sma40"].iloc[i]
+    c = x["close"].iloc[i]
+    if np.isnan(sma40) or np.isnan(c):
+        return False
+    return c < sma40
+
+
+def candle_touches_ma(low, high, ma_value) -> bool:
+    # "toca" = a média está dentro da faixa do candle
+    if np.isnan(ma_value):
+        return False
+    return (low <= ma_value <= high)
+
+
+def deepest_touched_ladder_ma(x, i):
+    """
+    Retorna o MA period mais "baixo" tocado no candle (maior período), ex.: 30 é mais baixo que 10.
+    Se tocar múltiplas no mesmo candle, pega a mais baixa (maior período).
+    """
+    lo = x["low"].iloc[i]
+    hi = x["high"].iloc[i]
+    touched = []
+    for p in LADDER_MAS:
+        v = x[f"sma{p}"].iloc[i]
+        if candle_touches_ma(lo, hi, v):
+            touched.append(p)
+    if not touched:
+        return None
+    return max(touched)
+
+
+def ladder_below_period(touched_period: int) -> int:
+    """
+    "média abaixo da tocada": 10->15, 15->20, ..., 40->45, 45->45 (fallback)
+    """
+    if touched_period not in LADDER_MAS:
+        return LADDER_MAS[-1]
+    idx = LADDER_MAS.index(touched_period)
+    if idx == len(LADDER_MAS) - 1:
+        return touched_period
+    return LADDER_MAS[idx + 1]
 
 
 # =============================
@@ -350,7 +457,7 @@ def run_backtest_generate_trades_4h(df_4h, cfg, htf_flags_1d_native=None):
     HTF (opcional) usa SOMENTE flags de 1D NATIVO (se disponível).
     """
     x = add_indicators(df_4h).copy()
-    if x.empty or len(x) < (SMA_LONG + 30):
+    if x.empty:
         return pd.DataFrame()
 
     x = x.sort_values("ts").reset_index(drop=True)
@@ -358,9 +465,7 @@ def run_backtest_generate_trades_4h(df_4h, cfg, htf_flags_1d_native=None):
     # Merge HTF 1D nativo -> 4H via merge_asof
     if cfg["use_htf"]:
         if htf_flags_1d_native is None or htf_flags_1d_native.empty:
-            # Pela sua regra: se não for 1D baixado separado, não usar HTF.
-            # Aqui a gente simplesmente não roda HTF (mas esse caso deve ser filtrado antes).
-            return pd.DataFrame()
+            return pd.DataFrame()  # regra: HTF só se 1D nativo existir
 
         tmp = pd.merge_asof(
             x[["ts"]],
@@ -375,110 +480,249 @@ def run_backtest_generate_trades_4h(df_4h, cfg, htf_flags_1d_native=None):
         x["htf_slope_up"] = True
 
     tick = float(x["close"].iloc[-1] * 0.0001)
-    start_idx = max(SMA_LONG + 20, SLOPE_LOOKBACK + 5)
+
+    # start_idx suficiente para SMA80 + ladder SMA45
+    start_idx = max(SMA_LONG + 20, SLOPE_LOOKBACK + 5, max(LADDER_MAS) + 5)
 
     trades = []
 
-    for i in range(start_idx, len(x) - 10):
-        # regime base no 4h
-        if not (x["trend_up"].iloc[i] and x["slope_up"].iloc[i]):
-            continue
+    # -------------------------
+    # Estado do MA_LADDER
+    # -------------------------
+    ladder_enabled = "MA_LADDER" in SETUPS
+    ladder_armed = False
+    ladder_armed_ts = pd.NaT
 
-        # HTF filter (1D nativo)
-        if cfg["use_htf"]:
-            if not x["htf_trend_up"].iloc[i]:
+    ladder_touched_period = None  # ex.: 10,15,...45 (mais baixo = maior número)
+    ladder_pending = False
+
+    # "ordem pendente" que vale para o PRÓXIMO candle
+    ladder_pending_entry = None
+    ladder_pending_stop = None
+    ladder_pending_signal_idx = None  # candle que definiu entry/stop
+    ladder_pending_touch_period = None
+
+    for i in range(start_idx, len(x)):
+        # 1) Se existe ordem pendente do ladder, checa fill NESTE candle
+        if ladder_enabled and ladder_pending:
+            if x["high"].iloc[i] >= ladder_pending_entry:
+                # entrou
+                fill_idx = i
+                entry = float(ladder_pending_entry)
+                stop = float(ladder_pending_stop)
+
+                # features do candle "sinal" (o candle que setou entry/stop)
+                si = int(ladder_pending_signal_idx) if ladder_pending_signal_idx is not None else i
+                si = max(0, min(si, len(x) - 1))
+
+                row = {
+                    "config": cfg["name"],
+                    "timeframe": "4h",
+                    "setup": "MA_LADDER",
+
+                    "armed_ts": ladder_armed_ts,
+                    "signal_ts": x["ts"].iloc[si],
+                    "fill_ts": x["ts"].iloc[fill_idx],
+
+                    "entry": entry,
+                    "stop": stop,
+                    "risk": entry - stop,
+
+                    # Stretch vars (ainda existem; úteis para filtros adicionais)
+                    "dist_sma8": float(x["dist_sma8"].iloc[si]) if not np.isnan(x["dist_sma8"].iloc[si]) else np.nan,
+                    "dist_sma80": float(x["dist_sma80"].iloc[si]) if not np.isnan(x["dist_sma80"].iloc[si]) else np.nan,
+                    "sma_gap": float(x["sma_gap"].iloc[si]) if not np.isnan(x["sma_gap"].iloc[si]) else np.nan,
+
+                    # Info do ladder
+                    "ladder_touch_ma": int(ladder_pending_touch_period) if ladder_pending_touch_period is not None else np.nan,
+                    "ladder_stop_ma": int(ladder_below_period(ladder_pending_touch_period)) if ladder_pending_touch_period is not None else np.nan,
+
+                    "use_htf": cfg["use_htf"],
+                    "use_time_exit": cfg["use_time_exit"],
+                    "use_breakeven": cfg["use_breakeven"],
+                }
+
+                # resultados por RR
+                for rr in RRS:
+                    hit, exit_type, r_res, exit_ts = simulate_trade_per_rr(
+                        x=x, fill_idx=fill_idx, entry=entry, initial_stop=stop, rr=rr, cfg=cfg
+                    )
+                    k = rr_key(rr)
+                    row[f"hit_{k}"] = bool(hit)
+                    row[f"exit_type_{k}"] = exit_type
+                    row[f"R_{k}"] = float(r_res) if r_res is not None else np.nan
+                    row[f"exit_ts_{k}"] = exit_ts
+
+                trades.append(row)
+
+                # após entrar: zera ladder e espera novo "armar"
+                ladder_armed = False
+                ladder_armed_ts = pd.NaT
+                ladder_touched_period = None
+                ladder_pending = False
+                ladder_pending_entry = None
+                ladder_pending_stop = None
+                ladder_pending_signal_idx = None
+                ladder_pending_touch_period = None
+
+                # importante: não processa mais lógica ladder neste candle após fill
+                # (o candle já foi "consumido" para entrada)
+                # mas ainda podemos deixar o loop seguir para os setups clássicos
+                # (decisão: não permitir múltiplos trades no mesmo candle)
+                # -> mantemos como está e ainda rodamos setups clássicos abaixo
+
+        # 2) SETUPS clássicos (PFR/DL/8.2/8.3) — só se estiverem habilitados
+        # Eles continuam usando o filtro base de regime (trend_up & slope_up) e HTF.
+        if any(s in SETUPS for s in ["PFR", "DL", "8.2", "8.3"]):
+            # regime base
+            if x["trend_up"].iloc[i] and x["slope_up"].iloc[i]:
+                # HTF filter
+                if (not cfg["use_htf"]) or (
+                    x["htf_trend_up"].iloc[i] and ((not HTF_REQUIRE_SLOPE) or x["htf_slope_up"].iloc[i])
+                ):
+                    pfr, dl, s82, s83 = check_signals(x, i)
+
+                    active = []
+                    if pfr and "PFR" in SETUPS:
+                        active.append("PFR")
+                    if dl and (not pfr) and "DL" in SETUPS:
+                        active.append("DL")
+                    if s82 and "8.2" in SETUPS:
+                        active.append("8.2")
+                    if s83 and "8.3" in SETUPS:
+                        active.append("8.3")
+
+                    for setup in active:
+                        max_wait = 3 if setup in ["8.2", "8.3"] else 1
+
+                        entry = float(x["high"].iloc[i] + tick)
+                        stop = float(x["low"].iloc[i] - tick)
+
+                        filled = False
+                        fill_idx = -1
+
+                        for w in range(1, max_wait + 1):
+                            if i + w >= len(x):
+                                break
+                            curr = x.iloc[i + w]
+
+                            if curr["high"] >= entry:
+                                filled = True
+                                fill_idx = i + w
+                                break
+
+                            if setup in ["8.2", "8.3"]:
+                                if not x["slope_up"].iloc[i + w]:
+                                    break
+                                if curr["high"] < entry - tick:
+                                    entry = float(curr["high"] + tick)
+                                    stop = float(min(stop, curr["low"] - tick))
+                            else:
+                                break
+
+                        if not filled:
+                            continue
+
+                        risk = entry - stop
+                        if risk <= 0 or np.isnan(risk):
+                            continue
+
+                        row = {
+                            "config": cfg["name"],
+                            "timeframe": "4h",
+                            "setup": setup,
+
+                            "armed_ts": pd.NaT,
+                            "signal_ts": x["ts"].iloc[i],
+                            "fill_ts": x["ts"].iloc[fill_idx],
+
+                            "entry": entry,
+                            "stop": stop,
+                            "risk": risk,
+
+                            "dist_sma8": float(x["dist_sma8"].iloc[i]) if not np.isnan(x["dist_sma8"].iloc[i]) else np.nan,
+                            "dist_sma80": float(x["dist_sma80"].iloc[i]) if not np.isnan(x["dist_sma80"].iloc[i]) else np.nan,
+                            "sma_gap": float(x["sma_gap"].iloc[i]) if not np.isnan(x["sma_gap"].iloc[i]) else np.nan,
+
+                            "ladder_touch_ma": np.nan,
+                            "ladder_stop_ma": np.nan,
+
+                            "use_htf": cfg["use_htf"],
+                            "use_time_exit": cfg["use_time_exit"],
+                            "use_breakeven": cfg["use_breakeven"],
+                        }
+
+                        for rr in RRS:
+                            hit, exit_type, r_res, exit_ts = simulate_trade_per_rr(
+                                x=x, fill_idx=fill_idx, entry=entry, initial_stop=stop, rr=rr, cfg=cfg
+                            )
+                            k = rr_key(rr)
+                            row[f"hit_{k}"] = bool(hit)
+                            row[f"exit_type_{k}"] = exit_type
+                            row[f"R_{k}"] = float(r_res) if r_res is not None else np.nan
+                            row[f"exit_ts_{k}"] = exit_ts
+
+                        trades.append(row)
+
+        # 3) SETUP MA_LADDER — state machine (armar/desarmar/tocar/rolar ordem)
+        if ladder_enabled:
+            # disarm (no close)
+            if ladder_armed and ladder_disarm_condition(x, i):
+                ladder_armed = False
+                ladder_armed_ts = pd.NaT
+                ladder_touched_period = None
+                ladder_pending = False
+                ladder_pending_entry = None
+                ladder_pending_stop = None
+                ladder_pending_signal_idx = None
+                ladder_pending_touch_period = None
                 continue
-            if HTF_REQUIRE_SLOPE and (not x["htf_slope_up"].iloc[i]):
-                continue
 
-        pfr, dl, s82, s83 = check_signals(x, i)
+            # arm (no close)
+            if not ladder_armed and ladder_armed_condition(x, i):
+                ladder_armed = True
+                ladder_armed_ts = x["ts"].iloc[i]
+                ladder_touched_period = None
+                ladder_pending = False
+                ladder_pending_entry = None
+                ladder_pending_stop = None
+                ladder_pending_signal_idx = None
+                ladder_pending_touch_period = None
 
-        active = []
-        if pfr:
-            active.append("PFR")
-        if dl and not pfr:
-            active.append("DL")
-        if s82:
-            active.append("8.2")
-        if s83:
-            active.append("8.3")
+            if ladder_armed:
+                # se houver toque em alguma MA, captura a "mais baixa" (maior período)
+                touched = deepest_touched_ladder_ma(x, i)
+                if touched is not None:
+                    if ladder_touched_period is None or touched > ladder_touched_period:
+                        ladder_touched_period = touched
 
-        if not active:
-            continue
+                # se já houve pelo menos 1 toque, mantemos ordem pendente rolando
+                if ladder_touched_period is not None:
+                    below_p = ladder_below_period(ladder_touched_period)
+                    below_ma_val = x[f"sma{below_p}"].iloc[i]
+                    touch_ma_val = x[f"sma{ladder_touched_period}"].iloc[i]
 
-        for setup in active:
-            max_wait = 3 if setup in ["8.2", "8.3"] else 1
-
-            entry = float(x["high"].iloc[i] + tick)
-            stop = float(x["low"].iloc[i] - tick)
-
-            filled = False
-            fill_idx = -1
-
-            # espera preenchimento
-            for w in range(1, max_wait + 1):
-                curr = x.iloc[i + w]
-
-                if curr["high"] >= entry:
-                    filled = True
-                    fill_idx = i + w
-                    break
-
-                if setup in ["8.2", "8.3"]:
-                    if not x["slope_up"].iloc[i + w]:
-                        break
-                    if curr["high"] < entry - tick:
-                        entry = float(curr["high"] + tick)
-                        stop = float(min(stop, curr["low"] - tick))
+                    # se alguma MA estiver NaN, não consegue manter ordem
+                    if np.isnan(below_ma_val) or np.isnan(touch_ma_val):
+                        ladder_pending = False
+                        ladder_pending_entry = None
+                        ladder_pending_stop = None
+                        ladder_pending_signal_idx = None
+                        ladder_pending_touch_period = None
+                    else:
+                        # A ordem que definimos AGORA vale para o PRÓXIMO candle
+                        ladder_pending = True
+                        ladder_pending_entry = float(x["high"].iloc[i] + tick)
+                        ladder_pending_stop = float(below_ma_val - tick)
+                        ladder_pending_signal_idx = i
+                        ladder_pending_touch_period = ladder_touched_period
                 else:
-                    break
-
-            if not filled:
-                continue
-
-            risk = entry - stop
-            if risk <= 0 or np.isnan(risk):
-                continue
-
-            # stretch features no candle do sinal (i)
-            dist8 = x["dist_sma8"].iloc[i]
-            dist80 = x["dist_sma80"].iloc[i]
-            gap = x["sma_gap"].iloc[i]
-            if np.isnan(dist8) or np.isnan(dist80) or np.isnan(gap):
-                continue
-
-            row = {
-                "config": cfg["name"],
-                "timeframe": "4h",
-                "setup": setup,
-
-                "signal_ts": x["ts"].iloc[i],
-                "fill_ts": x["ts"].iloc[fill_idx],
-
-                "entry": entry,
-                "stop": stop,
-                "risk": risk,
-
-                "dist_sma8": float(dist8),
-                "dist_sma80": float(dist80),
-                "sma_gap": float(gap),
-
-                "use_htf": cfg["use_htf"],
-                "use_time_exit": cfg["use_time_exit"],
-                "use_breakeven": cfg["use_breakeven"],
-            }
-
-            for rr in RRS:
-                hit, exit_type, r_res, exit_ts = simulate_trade_per_rr(
-                    x=x, fill_idx=fill_idx, entry=entry, initial_stop=stop, rr=rr, cfg=cfg
-                )
-                k = rr_key(rr)
-                row[f"hit_{k}"] = bool(hit)
-                row[f"exit_type_{k}"] = exit_type
-                row[f"R_{k}"] = float(r_res) if r_res is not None else np.nan
-                row[f"exit_ts_{k}"] = exit_ts
-
-            trades.append(row)
+                    # ainda não tocou nenhuma MA → não tem ordem pendente
+                    ladder_pending = False
+                    ladder_pending_entry = None
+                    ladder_pending_stop = None
+                    ladder_pending_signal_idx = None
+                    ladder_pending_touch_period = None
 
     return pd.DataFrame(trades)
 
@@ -487,12 +731,6 @@ def run_backtest_generate_trades_4h(df_4h, cfg, htf_flags_1d_native=None):
 # CONFIGS (somente variáveis estruturais)
 # =============================
 def build_structural_configs(htf_available: bool):
-    """
-    Variáveis ON/OFF:
-      - HTF (somente se 1D nativo estiver disponível)
-      - time-exit
-      - break-even
-    """
     configs = []
     use_htf_options = [False, True] if htf_available else [False]
 
@@ -574,7 +812,7 @@ def main():
     df_4h = fetch_4h(SYMBOL)
     if df_4h.empty:
         print("Erro: Sem dados 4h baixados.")
-        pd.DataFrame({"status": ["no_4h_data"]}).to_csv(f"results/only4h_native1dhtf_{SYMBOL}.csv", index=False)
+        pd.DataFrame({"status": ["no_4h_data"]}).to_csv(f"results/only4h_{SYMBOL}.csv", index=False)
         return
 
     if SAVE_OHLCV:
@@ -606,6 +844,7 @@ def main():
     # 3) Cria configs estruturais (com HTF somente se 1D nativo disponível)
     configs = build_structural_configs(htf_available=htf_available)
     print(f"ONLY 4H | HTF(native1d) available={htf_available} | configs={len(configs)}")
+    print(f"SETUPS={SETUPS} | RANK_SETUP={RANK_SETUP} | RANK_RR={RANK_RR}")
 
     # 4) Gera trades brutos por config (SEM stretch)
     all_trades = []
@@ -624,7 +863,7 @@ def main():
 
     if not all_trades:
         print("0 trades gerados.")
-        pd.DataFrame({"status": ["no_trades"]}).to_csv(f"results/only4h_native1dhtf_{SYMBOL}.csv", index=False)
+        pd.DataFrame({"status": ["no_trades"]}).to_csv(f"results/only4h_{SYMBOL}.csv", index=False)
         return
 
     trades = pd.concat(all_trades, ignore_index=True)
@@ -634,11 +873,16 @@ def main():
     train, test, cutoff = split_train_test(trades)
     print(f"Cutoff treino/teste: {cutoff}")
 
+    # Dataset de ranking (pode focar em um setup)
+    train_rank = filter_for_rank(train)
+    test_rank = filter_for_rank(test)
+
     # 6) Stage 1: ranking configs (sem stretch)
     stage1_rows = []
     for cfg_name, _ in trades.groupby("config"):
-        tr = train[train["config"] == cfg_name]
-        te = test[test["config"] == cfg_name]
+        tr = train_rank[train_rank["config"] == cfg_name]
+        te = test_rank[test_rank["config"] == cfg_name]
+
         m_tr = metrics_overall(tr, RANK_RR)
         m_te = metrics_overall(te, RANK_RR)
 
@@ -660,7 +904,7 @@ def main():
     stage1.to_csv(f"results/only4h_stage1_structural_{SYMBOL}.csv", index=False)
 
     print("\n=== Stage 1 (4h only, sem stretch) - ranking por Test AvgR @ RR="
-          f"{RANK_RR} (min test trades={MIN_TRADES_FOR_RANK_TEST}) ===")
+          f"{RANK_RR} | RankSetup={RANK_SETUP} (min test trades={MIN_TRADES_FOR_RANK_TEST}) ===")
     print(tabulate(stage1, headers="keys", tablefmt="grid", showindex=False))
 
     eligible = stage1[stage1["Eligible"]].copy()
@@ -677,8 +921,8 @@ def main():
     best_rows = []
 
     for cfg_name in top_cfgs:
-        base_train = train[train["config"] == cfg_name].copy()
-        base_test = test[test["config"] == cfg_name].copy()
+        base_train = train_rank[train_rank["config"] == cfg_name].copy()
+        base_test = test_rank[test_rank["config"] == cfg_name].copy()
 
         base_train_m = metrics_overall(base_train, RANK_RR)
         base_test_m = metrics_overall(base_test, RANK_RR)
@@ -712,7 +956,7 @@ def main():
                     "Train AvgR": m["AvgR"],
                 }
 
-        # fallback: se nada bateu mínimo de trades no treino, pega o melhor mesmo assim
+        # fallback
         if best is None:
             tmp = pd.DataFrame([r for r in stage2_rows if r["Config"] == cfg_name]).copy()
             tmp = tmp.sort_values(["Train AvgR", "Train Trades"], ascending=[False, False]).head(1)
@@ -744,7 +988,7 @@ def main():
             "BEST Test AvgR": best_test_m["AvgR"],
         })
 
-        # diagnóstico no TESTE por setup (somente 4h)
+        # diagnóstico no TESTE por setup (4h)
         per_setup = summary_by(best_test_filtered, RANK_RR, ["setup"])
         per_setup.to_csv(f"results/only4h_stage2_best_per_setup_{SYMBOL}_{cfg_name}.csv", index=False)
 
@@ -757,12 +1001,14 @@ def main():
     print("\n=== Stage 2 (4h only) - melhores stretch escolhidos no TREINO e validados no TESTE ===")
     print(tabulate(best_df, headers="keys", tablefmt="grid", showindex=False))
 
+    # salva markdown resumo
     with open(f"results/only4h_summary_{SYMBOL}.md", "w", encoding="utf-8") as f:
         f.write(f"# Only 4H Summary - {SYMBOL}\n\n")
         f.write("- Trades: somente 4h\n")
         f.write(f"- HTF: somente se 1D nativo baixar separado (available={htf_available})\n")
+        f.write(f"- SETUPS={SETUPS}\n")
+        f.write(f"- RANK_SETUP={RANK_SETUP} | RANK_RR={RANK_RR}\n")
         f.write(f"- Train fraction: {TRAIN_FRACTION}\n")
-        f.write(f"- Rank RR: {RANK_RR}\n")
         f.write(f"- Min test trades rank: {MIN_TRADES_FOR_RANK_TEST}\n")
         f.write(f"- Min train trades select: {MIN_TRADES_FOR_SELECT_TRAIN}\n")
         f.write(f"- Time exit bars (4h): {TIME_EXIT_BARS}\n")
