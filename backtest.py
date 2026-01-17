@@ -11,38 +11,13 @@ from itertools import product
 #
 # Objetivo:
 # - Baixar APENAS candles de 4h
-# - Rodar, na MESMA execução, estes cenários e imprimir tabelas Stage1 para você colar:
+# - Rodar, na MESMA execução, estes cenários e imprimir tabelas Stage1:
 #   1) Só MA_LADDER (rank em MA_LADDER)
 #   2) Só clássicos (PFR/DL/8.2/8.3) rank ALL
-#   3) Clássicos por setup: rank PFR, DL, 8.2, 8.3 (4 tabelas)
+#   3) Clássicos por setup: rank PFR, DL, 8.2, 8.3
 #
-# Regras:
-# - MA_LADDER:
-#   * ARMA quando close>sma10 e sma10>sma15>...>sma45
-#   * depois de armado, NÃO precisa manter alinhado
-#   * DESARMA se close < sma40
-#   * "tocar na média" = low <= MA
-#   * entry = high do candle + 1 tick (vale pro próximo candle)
-#   * stop = abaixo da MA imediatamente abaixo da tocada (10->15, ..., 40->45, 45->45)
-#   * enquanto não entra:
-#       - ENTRY rola (high do candle atual + tick)
-#       - STOP fica TRAVADO no valor do candle do toque mais baixo vigente
-#       - se tocar MA mais baixa, atualiza o stop (novo valor) e trava de novo
-#
-# - Clássicos (PFR/DL/8.2/8.3):
-#   Só executam se "mercado direcional" no 4h:
-#     * alinhamento: sma10>sma15>...>sma45
-#     * sma10 apontando para cima (sma10 > sma10[-1])
-#     * close>sma10 opcional (A/B via config c10)
-#
-# Configs (A/B):
-# - time-exit on/off (tx)
-# - break-even on/off (be)  (70% do alvo, efetivo no candle seguinte)
-# - close>sma10 nos clássicos on/off (c10) -> somente quando o cenário inclui clássicos
-#
-# Ranking:
-# - Split temporal TREINO/TESTE
-# - Ranking configs por Test AvgR no RR escolhido
+# Agora a tabela Stage1 mostra WR e AvgR para RR = 1, 1.5, 2 e 3
+# (tanto no TREINO quanto no TESTE), e o ranking continua pelo RANK_RR.
 # =========================================================
 
 # =============================
@@ -56,8 +31,8 @@ DEBUG = os.getenv("DEBUG", "0") == "1"
 LADDER_MAS = [10, 15, 20, 25, 30, 35, 40, 45]
 LADDER_DISARM_ON_CLOSE_BELOW = 40  # desarma se close < SMA40
 
-# RR
-RRS = [float(x) for x in os.getenv("RRS", "1.0,1.5,2.0").split(",")]
+# RR (default já inclui 3.0)
+RRS = [float(x) for x in os.getenv("RRS", "1.0,1.5,2.0,3.0").split(",")]
 RANK_RR = float(os.getenv("RANK_RR", "1.5"))
 
 # Download 4h
@@ -287,9 +262,6 @@ def check_signals_classic(x, i):
 # MA_LADDER helpers
 # =============================
 def ladder_armed_condition(x, i) -> bool:
-    """
-    Arma quando close>sma10 e alinhamento strict.
-    """
     if not ladder_aligned_strict(x, i):
         return False
     c = x["close"].iloc[i]
@@ -356,13 +328,11 @@ def simulate_trade_per_rr(x, fill_idx, entry, initial_stop, rr, cfg):
     for k in range(fill_idx, last_idx + 1):
         c = x.iloc[k]
 
-        # BE efetivo no início do candle seguinte ao trigger
         if cfg.get("use_breakeven", False) and be_pending and not be_active:
             stop = entry
             be_active = True
             be_pending = False
 
-        # ordem conservadora intrabar: stop -> target -> trigger BE
         if c["low"] <= stop:
             r = (stop - entry) / risk
             return False, "stop" if stop < entry else "breakeven_stop", float(r), c["ts"]
@@ -386,8 +356,6 @@ def simulate_trade_per_rr(x, fill_idx, entry, initial_stop, rr, cfg):
 # =============================
 def run_backtest_generate_trades_4h(x, cfg, setups):
     tick = float(x["close"].iloc[-1] * 0.0001)
-
-    # precisa de SMA45 e lookbacks pros clássicos
     start_idx = max(max(LADDER_MAS) + 5, 5)
 
     trades = []
@@ -395,7 +363,7 @@ def run_backtest_generate_trades_4h(x, cfg, setups):
     ladder_enabled = "MA_LADDER" in setups
     classics_enabled = any(s in setups for s in ["PFR", "DL", "8.2", "8.3"])
 
-    # ---------- Estado do MA_LADDER ----------
+    # MA_LADDER state
     ladder_armed = False
     ladder_armed_ts = pd.NaT
 
@@ -411,7 +379,7 @@ def run_backtest_generate_trades_4h(x, cfg, setups):
     ladder_pending_touch_idx = None
 
     for i in range(start_idx, len(x)):
-        # 1) Fill ordem pendente do ladder
+        # 1) fill ladder
         if ladder_enabled and ladder_pending:
             if x["high"].iloc[i] >= ladder_pending_entry:
                 fill_idx = i
@@ -458,7 +426,7 @@ def run_backtest_generate_trades_4h(x, cfg, setups):
 
                 trades.append(row)
 
-                # reset após entrada
+                # reset ladder
                 ladder_armed = False
                 ladder_armed_ts = pd.NaT
                 ladder_touched_period = None
@@ -472,89 +440,88 @@ def run_backtest_generate_trades_4h(x, cfg, setups):
                 ladder_pending_touch_period = None
                 ladder_pending_touch_idx = None
 
-        # 2) setups clássicos (filtrados por regime de MAs)
-        if classics_enabled:
-            if i >= 2 and classic_allowed_regime(x, i, cfg):
-                pfr, dl, s82, s83 = check_signals_classic(x, i)
+        # 2) classics
+        if classics_enabled and i >= 2 and classic_allowed_regime(x, i, cfg):
+            pfr, dl, s82, s83 = check_signals_classic(x, i)
 
-                active = []
-                if pfr and "PFR" in setups:
-                    active.append("PFR")
-                if dl and (not pfr) and "DL" in setups:
-                    active.append("DL")
-                if s82 and "8.2" in setups:
-                    active.append("8.2")
-                if s83 and "8.3" in setups:
-                    active.append("8.3")
+            active = []
+            if pfr and "PFR" in setups:
+                active.append("PFR")
+            if dl and (not pfr) and "DL" in setups:
+                active.append("DL")
+            if s82 and "8.2" in setups:
+                active.append("8.2")
+            if s83 and "8.3" in setups:
+                active.append("8.3")
 
-                for setup in active:
-                    max_wait = 3 if setup in ["8.2", "8.3"] else 1
+            for setup in active:
+                max_wait = 3 if setup in ["8.2", "8.3"] else 1
 
-                    entry = float(x["high"].iloc[i] + tick)
-                    stop = float(x["low"].iloc[i] - tick)
+                entry = float(x["high"].iloc[i] + tick)
+                stop = float(x["low"].iloc[i] - tick)
 
-                    filled = False
-                    fill_idx = -1
+                filled = False
+                fill_idx = -1
 
-                    for w in range(1, max_wait + 1):
-                        if i + w >= len(x):
-                            break
-                        curr = x.iloc[i + w]
+                for w in range(1, max_wait + 1):
+                    if i + w >= len(x):
+                        break
+                    curr = x.iloc[i + w]
 
-                        if curr["high"] >= entry:
-                            filled = True
-                            fill_idx = i + w
-                            break
+                    if curr["high"] >= entry:
+                        filled = True
+                        fill_idx = i + w
+                        break
 
-                        if setup in ["8.2", "8.3"]:
-                            if curr["high"] < entry - tick:
-                                entry = float(curr["high"] + tick)
-                                stop = float(min(stop, curr["low"] - tick))
-                        else:
-                            break
+                    if setup in ["8.2", "8.3"]:
+                        if curr["high"] < entry - tick:
+                            entry = float(curr["high"] + tick)
+                            stop = float(min(stop, curr["low"] - tick))
+                    else:
+                        break
 
-                    if not filled:
-                        continue
+                if not filled:
+                    continue
 
-                    risk = entry - stop
-                    if risk <= 0 or np.isnan(risk):
-                        continue
+                risk = entry - stop
+                if risk <= 0 or np.isnan(risk):
+                    continue
 
-                    row = {
-                        "config": cfg["name"],
-                        "timeframe": "4h",
-                        "setup": setup,
+                row = {
+                    "config": cfg["name"],
+                    "timeframe": "4h",
+                    "setup": setup,
 
-                        "armed_ts": pd.NaT,
-                        "ladder_touch_ts": pd.NaT,
-                        "signal_ts": x["ts"].iloc[i],
-                        "fill_ts": x["ts"].iloc[fill_idx],
+                    "armed_ts": pd.NaT,
+                    "ladder_touch_ts": pd.NaT,
+                    "signal_ts": x["ts"].iloc[i],
+                    "fill_ts": x["ts"].iloc[fill_idx],
 
-                        "entry": entry,
-                        "stop": stop,
-                        "risk": risk,
+                    "entry": entry,
+                    "stop": stop,
+                    "risk": risk,
 
-                        "ladder_touch_ma": np.nan,
-                        "ladder_stop_ma": np.nan,
+                    "ladder_touch_ma": np.nan,
+                    "ladder_stop_ma": np.nan,
 
-                        "use_time_exit": cfg.get("use_time_exit", False),
-                        "use_breakeven": cfg.get("use_breakeven", False),
-                        "req_close_gt10": cfg.get("req_close_gt10", np.nan),
-                    }
+                    "use_time_exit": cfg.get("use_time_exit", False),
+                    "use_breakeven": cfg.get("use_breakeven", False),
+                    "req_close_gt10": cfg.get("req_close_gt10", np.nan),
+                }
 
-                    for rr in RRS:
-                        hit, exit_type, r_res, exit_ts = simulate_trade_per_rr(
-                            x=x, fill_idx=fill_idx, entry=entry, initial_stop=stop, rr=rr, cfg=cfg
-                        )
-                        k = rr_key(rr)
-                        row[f"hit_{k}"] = bool(hit)
-                        row[f"exit_type_{k}"] = exit_type
-                        row[f"R_{k}"] = float(r_res) if r_res is not None else np.nan
-                        row[f"exit_ts_{k}"] = exit_ts
+                for rr in RRS:
+                    hit, exit_type, r_res, exit_ts = simulate_trade_per_rr(
+                        x=x, fill_idx=fill_idx, entry=entry, initial_stop=stop, rr=rr, cfg=cfg
+                    )
+                    k = rr_key(rr)
+                    row[f"hit_{k}"] = bool(hit)
+                    row[f"exit_type_{k}"] = exit_type
+                    row[f"R_{k}"] = float(r_res) if r_res is not None else np.nan
+                    row[f"exit_ts_{k}"] = exit_ts
 
-                    trades.append(row)
+                trades.append(row)
 
-        # 3) MA_LADDER state machine
+        # 3) ladder state machine
         if ladder_enabled:
             if ladder_armed and ladder_disarm_condition(x, i):
                 ladder_armed = False
@@ -588,22 +555,18 @@ def run_backtest_generate_trades_4h(x, cfg, setups):
             if ladder_armed:
                 touched = deepest_touched_ladder_ma(x, i)
 
-                if touched is not None:
-                    if ladder_touched_period is None or touched > ladder_touched_period:
-                        ladder_touched_period = touched
-                        ladder_touch_idx = i
+                if touched is not None and (ladder_touched_period is None or touched > ladder_touched_period):
+                    ladder_touched_period = touched
+                    ladder_touch_idx = i
 
-                        below_p = ladder_below_period(ladder_touched_period)
-                        below_ma_val = x[f"sma{below_p}"].iloc[i]
-                        if np.isnan(below_ma_val):
-                            ladder_stop_fixed = None
-                        else:
-                            ladder_stop_fixed = float(below_ma_val - tick)  # FIXO
+                    below_p = ladder_below_period(ladder_touched_period)
+                    below_ma_val = x[f"sma{below_p}"].iloc[i]
+                    ladder_stop_fixed = None if np.isnan(below_ma_val) else float(below_ma_val - tick)
 
                 if ladder_touched_period is not None and ladder_stop_fixed is not None:
                     ladder_pending = True
-                    ladder_pending_entry = float(x["high"].iloc[i] + tick)  # ENTRY rola
-                    ladder_pending_stop = float(ladder_stop_fixed)          # STOP travado
+                    ladder_pending_entry = float(x["high"].iloc[i] + tick)  # rola entry
+                    ladder_pending_stop = float(ladder_stop_fixed)          # stop travado
                     ladder_pending_signal_idx = i
                     ladder_pending_touch_period = ladder_touched_period
                     ladder_pending_touch_idx = ladder_touch_idx
@@ -624,7 +587,6 @@ def run_backtest_generate_trades_4h(x, cfg, setups):
 def build_structural_configs(include_c10: bool):
     configs = []
     if include_c10:
-        # 2 x 2 x 2 = 8 configs
         for use_time_exit, use_breakeven, req_close_gt10 in product([False, True], [False, True], [False, True]):
             name = f"tx{int(use_time_exit)}_be{int(use_breakeven)}_c10{int(req_close_gt10)}"
             configs.append({
@@ -634,7 +596,6 @@ def build_structural_configs(include_c10: bool):
                 "req_close_gt10": req_close_gt10,
             })
     else:
-        # 2 x 2 = 4 configs (c10 não faz diferença sem clássicos)
         for use_time_exit, use_breakeven in product([False, True], [False, True]):
             name = f"tx{int(use_time_exit)}_be{int(use_breakeven)}"
             configs.append({
@@ -661,7 +622,7 @@ def split_train_test(trades_df):
     return train, test, cutoff
 
 
-def metrics_overall(trades_df, rr):
+def metrics_for_rr(trades_df, rr):
     if trades_df.empty:
         return {"Trades": 0, "WR": np.nan, "AvgR": np.nan}
     k = rr_key(rr)
@@ -684,7 +645,6 @@ def run_scenario(x, scenario_name: str, setups: list, rank_setup: str):
     for cfg in configs:
         t = run_backtest_generate_trades_4h(x=x, cfg=cfg, setups=setups)
         if not t.empty:
-            # tag do cenário para facilitar debug no CSV
             t.insert(0, "scenario", scenario_name)
             all_trades.append(t)
 
@@ -693,46 +653,60 @@ def run_scenario(x, scenario_name: str, setups: list, rank_setup: str):
 
     trades = pd.concat(all_trades, ignore_index=True)
 
-    # split
     train, test, cutoff = split_train_test(trades)
-
     train_rank = filter_for_rank(train, rank_setup)
     test_rank = filter_for_rank(test, rank_setup)
 
-    # stage1
     rows = []
     for cfg_name, _ in trades.groupby("config"):
         tr = train_rank[train_rank["config"] == cfg_name]
         te = test_rank[test_rank["config"] == cfg_name]
-        m_tr = metrics_overall(tr, RANK_RR)
-        m_te = metrics_overall(te, RANK_RR)
 
-        rows.append({
+        row = {
             "Scenario": scenario_name,
             "RankSetup": rank_setup,
             "Config": cfg_name,
-            "Train Trades": m_tr["Trades"],
-            "Train WR": m_tr["WR"],
-            "Train AvgR": m_tr["AvgR"],
-            "Test Trades": m_te["Trades"],
-            "Test WR": m_te["WR"],
-            "Test AvgR": m_te["AvgR"],
-            "Eligible": (m_te["Trades"] >= MIN_TRADES_FOR_RANK_TEST),
-        })
+            "Train Trades": len(tr),
+            "Test Trades": len(te),
+            "Eligible": (len(te) >= MIN_TRADES_FOR_RANK_TEST),
+        }
 
-    stage1 = pd.DataFrame(rows).sort_values(
-        ["Eligible", "Test AvgR", "Test Trades"],
+        # métricas para cada RR solicitado
+        for rr in RRS:
+            k = rr_key(rr)
+            m_tr = metrics_for_rr(tr, rr)
+            m_te = metrics_for_rr(te, rr)
+            row[f"Train WR {k}"] = m_tr["WR"]
+            row[f"Train AvgR {k}"] = m_tr["AvgR"]
+            row[f"Test WR {k}"] = m_te["WR"]
+            row[f"Test AvgR {k}"] = m_te["AvgR"]
+
+        rows.append(row)
+
+    stage1 = pd.DataFrame(rows)
+
+    # Ranking principal pelo Test AvgR do RANK_RR
+    rk = rr_key(RANK_RR)
+    stage1 = stage1.sort_values(
+        ["Eligible", f"Test AvgR {rk}", "Test Trades"],
         ascending=[False, False, False]
     )
 
-    # save
     trades.to_csv(f"results/scenario_trades_{SYMBOL}_{scenario_name}.csv", index=False)
     stage1.to_csv(f"results/scenario_stage1_{SYMBOL}_{scenario_name}.csv", index=False)
 
-    # print table for copy/paste
-    print("\n" + "=" * 80)
+    # Print para você colar aqui
+    print("\n" + "=" * 90)
     print(f"SCENARIO: {scenario_name} | SETUPS={setups} | RANK_SETUP={rank_setup} | RANK_RR={RANK_RR}")
     print(f"Cutoff train/test: {cutoff}")
+    cols = ["Config", "Train Trades", "Test Trades"] + \
+           [f"Test AvgR {rr_key(RANK_RR)}"] + \
+           [f"Test WR {rr_key(rr)}" for rr in RRS] + \
+           [f"Test AvgR {rr_key(rr)}" for rr in RRS]
+    # Mostra tabela completa (mas numa ordem “boa de ler”)
+    show = stage1.copy()
+    # se algum RR faltar por env, garante
+    show = show[[c for c in show.columns if c in stage1.columns]]
     print(tabulate(stage1.drop(columns=["Scenario", "RankSetup"]), headers="keys", tablefmt="grid", showindex=False))
 
     return trades, stage1
@@ -755,22 +729,15 @@ def main():
 
     x = add_indicators(df_4h).sort_values("ts").reset_index(drop=True)
 
-    # Cenários solicitados
     scenarios = [
-        # 1) Só MA_LADDER
         ("LADDER_ONLY", ["MA_LADDER"], "MA_LADDER"),
-
-        # 2) Só clássicos (ALL)
         ("CLASSICS_ALL", ["PFR", "DL", "8.2", "8.3"], "ALL"),
-
-        # 3) Clássicos por setup (4 tabelas)
         ("CLASSICS_PFR", ["PFR", "DL", "8.2", "8.3"], "PFR"),
         ("CLASSICS_DL", ["PFR", "DL", "8.2", "8.3"], "DL"),
         ("CLASSICS_8_2", ["PFR", "DL", "8.2", "8.3"], "8.2"),
         ("CLASSICS_8_3", ["PFR", "DL", "8.2", "8.3"], "8.3"),
     ]
 
-    # roda todos e salva um "master" também
     master_stage1 = []
     for name, setups, rank_setup in scenarios:
         _, s1 = run_scenario(x=x, scenario_name=name, setups=setups, rank_setup=rank_setup)
@@ -783,7 +750,8 @@ def main():
 
         with open(f"results/scenario_summary_{SYMBOL}.md", "w", encoding="utf-8") as f:
             f.write(f"# Scenario Summary - {SYMBOL}\n\n")
-            f.write(f"- RR rank: {RANK_RR}\n")
+            f.write(f"- RRs: {RRS}\n")
+            f.write(f"- Rank RR: {RANK_RR}\n")
             f.write(f"- Train fraction: {TRAIN_FRACTION}\n")
             f.write(f"- Time exit bars (4h): {TIME_EXIT_BARS}\n")
             f.write(f"- Break-even fraction of target: {BE_TARGET_FRACTION}\n\n")
