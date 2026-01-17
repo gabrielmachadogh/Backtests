@@ -13,7 +13,7 @@ jobs:
     env:
       SYMBOL: BTC_USDT
       TIMEFRAMES: 1h,2h,4h,1d
-      SETUPS: PFR,DL
+      SETUPS: PFR,DL,8.2,8.3
       
       # Parâmetros
       SMA_SHORT: "8"
@@ -21,16 +21,24 @@ jobs:
       SLOPE_LOOKBACK: "8"
       ATR_PERIOD: "14"
       RSI_PERIOD: "14"
+      LOOKBACK_N: "20"
+      EXTREME_LOOKBACK: "20"
       
-      # Regras de Ouro
-      MAX_ENTRY_WAIT_BARS: "1"
+      # Regras de Execução
+      # Aumentado para 3 para permitir o "trailing entry" dos setups 8.2 e 8.3
+      MAX_ENTRY_WAIT_BARS: "3" 
+      MAX_HOLD_BARS: "50"
       AMBIGUOUS_POLICY: loss
       
       # Histórico
       MAX_BARS_1H: "25000"
       WINDOW_DAYS: "30"
+      TICK_SIZE: "0"
       
       RRS: "1,1.5,2"
+      
+      # Debug
+      DEBUG: "0"
 
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +55,4 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git pull --rebase || true
-          git add results/* || true
-          git commit -m "Updated Long-Only Analysis" || echo "no changes"
-          git push
+          # Adiciona todos os arquivos da pasta results (csv e 
