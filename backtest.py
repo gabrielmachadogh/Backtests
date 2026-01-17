@@ -6,20 +6,16 @@ import pandas as pd
 from tabulate import tabulate
 
 BASE_URL = os.getenv("MEXC_CONTRACT_BASE_URL", "https://contract.mexc.com/api/v1")
-SYMBOL = "BTC_USDT" # Fixo para garantir
+SYMBOL = "BTC_USDT"
 
-# Removido 15m. Foco no que é robusto.
-TIMEFRAMES = ["1h", "2h", "4h", "1d"] 
+TIMEFRAMES = ["1h", "2h", "4h", "1d"]
 SETUPS = ["PFR", "DL", "8.2", "8.3"]
 
 SMA_SHORT = 8
 SMA_LONG = 80
 SLOPE_LOOKBACK = 8
 
-# RRs
 RRS = [1.0, 1.5, 2.0]
-
-# Baixa ~2 anos de 1h (~17.500 candles)
 MAX_BARS_FETCH = 18000 
 WINDOW_DAYS = 30 
 
@@ -28,26 +24,67 @@ def http_get_json(url, params=None, tries=3):
     for i in range(tries):
         try:
             r = requests.get(url, params=params, timeout=20)
-            r.raise_for_status()
-            return r.json()
-        except: time.sleep(1)
+            if r.status_code == 200:
+                return r.json()
+        except: 
+            time.sleep(1)
     return None
 
 def parse_kline(payload):
-    if not payload or not payload.get("data"): return pd.DataFrame()
-    data = payload["data"]
+    # Proteção contra resposta vazia/nula
+    if not payload or not isinstance(payload, dict): 
+        return pd.DataFrame()
+        
+    data = payload.get("data", [])
+    
+    # Se data for None ou lista vazia
+    if not data: 
+        return pd.DataFrame()
     
     cols = ['ts', 'open', 'high', 'low', 'close', 'vol']
-    if isinstance(data[0], list): df = pd.DataFrame(data, columns=['time'] + cols[1:])
-    else: df = pd.DataFrame(data)
     
-    df = df.rename(columns={'time': 'ts', 'vol': 'volume'})
-    # Garante colunas numéricas
+    try:
+        # Formato Lista de Listas (padrão antigo)
+        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
+            df = pd.DataFrame(data, columns=['time'] + cols[1:])
+            
+        # Formato Lista de Dicts (padrão novo)
+        elif isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+            df = pd.DataFrame(data)
+            
+        else:
+            return pd.DataFrame() # Formato desconhecido
+            
+    except Exception:
+        return pd.DataFrame() # Erro ao criar DF
+    
+    # Normalização
+    if 'time' in df.columns: df = df.rename(columns={'time': 'ts'})
+    if 'vol' in df.columns: df = df.rename(columns={'vol': 'volume'})
+    
+    required = ['ts', 'open', 'high', 'low', 'close', 'volume']
+    for c in required:
+        if c not in df.columns: df[c] = np.nan
+        
+    df = df[required].copy()
+    
+    # Conversão Numérica Segura
     for c in ['open', 'high', 'low', 'close', 'volume']:
         df[c] = pd.to_numeric(df[c], errors='coerce')
-    df['ts'] = pd.to_datetime(pd.to_numeric(df['ts']), unit='s', utc=True) if df['ts'].iloc[0] < 1e11 else pd.to_datetime(pd.to_numeric(df['ts']), unit='ms', utc=True)
+        
+    # Conversão de Tempo
+    df['ts'] = pd.to_numeric(df['ts'], errors='coerce')
+    df = df.dropna(subset=['ts'])
     
-    return df[['ts', 'open', 'high', 'low', 'close', 'volume']].sort_values('ts').reset_index(drop=True)
+    if df.empty: return df
+    
+    # Detecção automática de ms ou s
+    if df['ts'].iloc[0] > 1e11: # é ms
+        df['ts'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
+    else:
+        df['ts'] = pd.to_datetime(df['ts'], unit='s', utc=True)
+        
+    return df.sort_values('ts').reset_index(drop=True)
 
 def fetch_history(symbol):
     print(f"Baixando histórico 1h para {symbol}...")
@@ -55,29 +92,39 @@ def fetch_history(symbol):
     end_ts = int(time.time())
     step = WINDOW_DAYS * 86400
     
-    # Loop de download
-    while len(all_dfs) * 24 * WINDOW_DAYS < MAX_BARS_FETCH:
+    # Loop de download (limite de segurança para não rodar infinito)
+    for _ in range(50):
+        if len(all_dfs) * 24 * WINDOW_DAYS >= MAX_BARS_FETCH: break
+        
         start_ts = end_ts - step
         data = http_get_json(f"{BASE_URL}/contract/kline/{symbol}", {'interval': 'Min60', 'start': start_ts, 'end': end_ts})
+        
         df = parse_kline(data)
         
         if df.empty: break
+        
         all_dfs.append(df)
         
         # Recua o tempo
-        first_ts = int(df.iloc[0]['ts'].timestamp())
-        if first_ts >= end_ts: break # Evita loop infinito
-        end_ts = first_ts - 1
+        first_ts_val = df.iloc[0]['ts'].timestamp()
+        if first_ts_val >= end_ts: break 
+        end_ts = int(first_ts_val) - 1
+        
         time.sleep(0.2)
         
     if not all_dfs: return pd.DataFrame()
+    
     full_df = pd.concat(all_dfs).drop_duplicates('ts').sort_values('ts').reset_index(drop=True)
     print(f"Total baixado: {len(full_df)} candles.")
     return full_df
 
 def resample(df, rule):
+    if df.empty: return df
     if rule == '1h': return df.copy()
+    
     mapping = {'2h': '2h', '4h': '4h', '1d': '1d'}
+    if rule not in mapping: return df
+    
     df = df.set_index('ts')
     agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
     res = df.resample(mapping[rule]).agg(agg).dropna()
@@ -96,19 +143,19 @@ def add_indicators(df):
     return x
 
 def check_signals(x, i):
-    # PFR: Low < Low-1 < Low-2 & Close > Close-1
+    # PFR
     pfr = (x['low'].iloc[i] < x['low'].iloc[i-1]) and \
           (x['low'].iloc[i] < x['low'].iloc[i-2]) and \
           (x['close'].iloc[i] > x['close'].iloc[i-1])
           
-    # DL: Low < Low-1 < Low-2
+    # DL
     dl = (x['low'].iloc[i] < x['low'].iloc[i-1]) and \
          (x['low'].iloc[i] < x['low'].iloc[i-2])
          
-    # 8.2: Close < Low-1
+    # 8.2
     s82 = x['close'].iloc[i] < x['low'].iloc[i-1]
     
-    # 8.3: Close < Close-2 & Close-1 < Close-2 & !8.2 anterior
+    # 8.3
     s83 = (x['close'].iloc[i] < x['close'].iloc[i-2]) and \
           (x['close'].iloc[i-1] < x['close'].iloc[i-2]) and \
           (x['close'].iloc[i-1] >= x['low'].iloc[i-2])
@@ -138,8 +185,6 @@ def run_backtest(df, tf):
         if not active: continue
         
         for setup in active:
-            # PFR/DL = Rompimento Imediato (Wait=1)
-            # 8.2/8.3 = Trailing (Wait=3)
             max_wait = 3 if setup in ['8.2', '8.3'] else 1
             
             entry = x['high'].iloc[i] + tick
@@ -155,18 +200,16 @@ def run_backtest(df, tf):
                     fill_idx = i+w
                     break
                 
-                # Lógica de trailing para 8.2/8.3
                 if setup in ['8.2', '8.3']:
-                    if not x['slope_up'].iloc[i+w]: break # Perdeu inclinação, aborta
+                    if not x['slope_up'].iloc[i+w]: break
                     if curr['high'] < entry - tick:
                         entry = curr['high'] + tick
                         stop = min(stop, curr['low'] - tick)
                 else:
-                    break # PFR/DL não espera
+                    break
             
             if not filled: continue
             
-            # Resultado
             res_row = {'timeframe': tf, 'setup': setup}
             for rr in RRS:
                 target = entry + (abs(entry-stop) * rr)
@@ -188,14 +231,13 @@ def run_backtest(df, tf):
 def main():
     os.makedirs("results", exist_ok=True)
     
-    # 1. Download
     df_raw = fetch_history(SYMBOL)
     if df_raw.empty:
-        # Cria arquivo vazio para não falhar
-        pd.DataFrame({'status': ['no_data']}).to_csv("results/baseline_trades.csv")
+        print("Erro: Sem dados baixados.")
+        # Salva dummy para não quebrar CI
+        pd.DataFrame({'status': ['no_data']}).to_csv("results/baseline_trades_BTC_USDT.csv")
         return
 
-    # 2. Processamento
     all_trades = []
     for tf in TIMEFRAMES:
         print(f"Rodando {tf}...")
@@ -207,12 +249,10 @@ def main():
         except Exception as e:
             print(f"Erro em {tf}: {e}")
 
-    # 3. Salvar
     if all_trades:
         final = pd.concat(all_trades)
         final.to_csv(f"results/baseline_trades_{SYMBOL}.csv", index=False)
         
-        # Summary
         summary = []
         for (tf, st), g in final.groupby(['timeframe', 'setup']):
             row = {'TF': tf, 'Setup': st, 'Trades': len(g)}
@@ -225,7 +265,8 @@ def main():
         print(tabulate(sum_df, headers='keys', tablefmt='grid'))
         
         with open(f"results/baseline_summary_{SYMBOL}.md", "w") as f:
-            f.write(tabulate(sum_df, headers="keys", tablefmt="pipe"))
+            f.write(f"# Baseline Long Only - {SYMBOL}\n\n")
+            f.write(tabulate(sum_df, headers="keys", tablefmt="pipe", showindex=False))
     else:
         print("0 trades gerados.")
         pd.DataFrame({'status': ['no_trades']}).to_csv(f"results/baseline_trades_{SYMBOL}.csv")
