@@ -7,36 +7,41 @@ from tabulate import tabulate
 from itertools import product
 
 # =========================================================
-# ONLY 4H TRADING (NO HTF)
+# ONLY 4H TRADING (NO HTF) + MULTI-SCENARIO RUN
 #
-# - Baixa APENAS 4h e roda tudo no 4h.
+# Objetivo:
+# - Baixar APENAS candles de 4h
+# - Rodar, na MESMA execução, estes cenários e imprimir tabelas Stage1 para você colar:
+#   1) Só MA_LADDER (rank em MA_LADDER)
+#   2) Só clássicos (PFR/DL/8.2/8.3) rank ALL
+#   3) Clássicos por setup: rank PFR, DL, 8.2, 8.3 (4 tabelas)
 #
-# SETUPS:
+# Regras:
 # - MA_LADDER:
-#     * ARMA quando close>sma10 e sma10>sma15>...>sma45
-#     * depois de armado, não precisa manter alinhado
-#     * DESARMA se close < sma40
-#     * "tocar na média" = low <= MA
-#     * gatilho entry = high do candle + 1 tick (vale pro próximo candle)
-#     * stop = abaixo da MA imediatamente abaixo da tocada (10->15, ..., 40->45, 45->45)
-#     * enquanto não entra:
-#         - ENTRY rola (high do candle atual + tick)
-#         - STOP fica TRAVADO no valor do candle do toque mais baixo vigente
-#         - se tocar MA mais baixa, atualiza o stop (novo valor) e trava de novo
+#   * ARMA quando close>sma10 e sma10>sma15>...>sma45
+#   * depois de armado, NÃO precisa manter alinhado
+#   * DESARMA se close < sma40
+#   * "tocar na média" = low <= MA
+#   * entry = high do candle + 1 tick (vale pro próximo candle)
+#   * stop = abaixo da MA imediatamente abaixo da tocada (10->15, ..., 40->45, 45->45)
+#   * enquanto não entra:
+#       - ENTRY rola (high do candle atual + tick)
+#       - STOP fica TRAVADO no valor do candle do toque mais baixo vigente
+#       - se tocar MA mais baixa, atualiza o stop (novo valor) e trava de novo
 #
-# - PFR / DL / 8.2 / 8.3:
-#     Só executam se "mercado direcional" no 4h:
-#       * alinhamento: sma10>sma15>...>sma45
-#       * sma10 apontando para cima (sma10 > sma10[-1])
-#       * close>sma10 opcional (testável com e sem via config c10)
+# - Clássicos (PFR/DL/8.2/8.3):
+#   Só executam se "mercado direcional" no 4h:
+#     * alinhamento: sma10>sma15>...>sma45
+#     * sma10 apontando para cima (sma10 > sma10[-1])
+#     * close>sma10 opcional (A/B via config c10)
 #
-# Experimentos (configs):
-# - time-exit on/off (sai a mercado após N candles e calcula R real)
-# - break-even on/off (70% do alvo, efetivo no candle seguinte)
-# - require close>sma10 for classics (c10) on/off
+# Configs (A/B):
+# - time-exit on/off (tx)
+# - break-even on/off (be)  (70% do alvo, efetivo no candle seguinte)
+# - close>sma10 nos clássicos on/off (c10) -> somente quando o cenário inclui clássicos
 #
 # Ranking:
-# - Split TREINO/TESTE
+# - Split temporal TREINO/TESTE
 # - Ranking configs por Test AvgR no RR escolhido
 # =========================================================
 
@@ -46,11 +51,6 @@ from itertools import product
 BASE_URL = os.getenv("MEXC_CONTRACT_BASE_URL", "https://contract.mexc.com/api/v1")
 SYMBOL = os.getenv("SYMBOL", "BTC_USDT")
 DEBUG = os.getenv("DEBUG", "0") == "1"
-
-TRADING_TF = "4h"
-
-SETUPS = [s.strip() for s in os.getenv("SETUPS", "MA_LADDER,PFR,DL,8.2,8.3").split(",") if s.strip()]
-RANK_SETUP = os.getenv("RANK_SETUP", "ALL")  # "ALL" ou "MA_LADDER" etc.
 
 # Ladder MAs
 LADDER_MAS = [10, 15, 20, 25, 30, 35, 40, 45]
@@ -87,12 +87,12 @@ def rr_key(rr: float) -> str:
     return str(rr)
 
 
-def filter_for_rank(df: pd.DataFrame) -> pd.DataFrame:
+def filter_for_rank(df: pd.DataFrame, rank_setup: str) -> pd.DataFrame:
     if df.empty:
         return df
-    if (RANK_SETUP or "").upper() == "ALL":
+    if (rank_setup or "").upper() == "ALL":
         return df
-    return df[df["setup"] == RANK_SETUP].copy()
+    return df[df["setup"] == rank_setup].copy()
 
 
 # =============================
@@ -259,7 +259,7 @@ def classic_allowed_regime(x, i, cfg) -> bool:
         return False
     if not bool(x["sma10_up"].iloc[i]):
         return False
-    if cfg["req_close_gt10"] and (not bool(x["close_gt_sma10"].iloc[i])):
+    if cfg.get("req_close_gt10", False) and (not bool(x["close_gt_sma10"].iloc[i])):
         return False
     return True
 
@@ -357,7 +357,7 @@ def simulate_trade_per_rr(x, fill_idx, entry, initial_stop, rr, cfg):
         c = x.iloc[k]
 
         # BE efetivo no início do candle seguinte ao trigger
-        if cfg["use_breakeven"] and be_pending and not be_active:
+        if cfg.get("use_breakeven", False) and be_pending and not be_active:
             stop = entry
             be_active = True
             be_pending = False
@@ -370,10 +370,10 @@ def simulate_trade_per_rr(x, fill_idx, entry, initial_stop, rr, cfg):
         if c["high"] >= target:
             return True, "target", float(rr), c["ts"]
 
-        if cfg["use_breakeven"] and (not be_active) and (c["high"] >= be_trigger):
+        if cfg.get("use_breakeven", False) and (not be_active) and (c["high"] >= be_trigger):
             be_pending = True
 
-    if cfg["use_time_exit"]:
+    if cfg.get("use_time_exit", False):
         exit_px = float(x["close"].iloc[last_idx])
         r = (exit_px - entry) / risk
         return False, "time_exit", float(r), x["ts"].iloc[last_idx]
@@ -384,12 +384,7 @@ def simulate_trade_per_rr(x, fill_idx, entry, initial_stop, rr, cfg):
 # =============================
 # BACKTEST CORE (gera trades brutos)
 # =============================
-def run_backtest_generate_trades_4h(df_4h, cfg):
-    x = add_indicators(df_4h).copy()
-    if x.empty:
-        return pd.DataFrame()
-    x = x.sort_values("ts").reset_index(drop=True)
-
+def run_backtest_generate_trades_4h(x, cfg, setups):
     tick = float(x["close"].iloc[-1] * 0.0001)
 
     # precisa de SMA45 e lookbacks pros clássicos
@@ -397,8 +392,10 @@ def run_backtest_generate_trades_4h(df_4h, cfg):
 
     trades = []
 
+    ladder_enabled = "MA_LADDER" in setups
+    classics_enabled = any(s in setups for s in ["PFR", "DL", "8.2", "8.3"])
+
     # ---------- Estado do MA_LADDER ----------
-    ladder_enabled = "MA_LADDER" in SETUPS
     ladder_armed = False
     ladder_armed_ts = pd.NaT
 
@@ -444,9 +441,9 @@ def run_backtest_generate_trades_4h(df_4h, cfg):
                     "ladder_touch_ma": int(ladder_pending_touch_period) if ladder_pending_touch_period is not None else np.nan,
                     "ladder_stop_ma": int(ladder_below_period(ladder_pending_touch_period)) if ladder_pending_touch_period is not None else np.nan,
 
-                    "use_time_exit": cfg["use_time_exit"],
-                    "use_breakeven": cfg["use_breakeven"],
-                    "req_close_gt10": cfg["req_close_gt10"],
+                    "use_time_exit": cfg.get("use_time_exit", False),
+                    "use_breakeven": cfg.get("use_breakeven", False),
+                    "req_close_gt10": cfg.get("req_close_gt10", np.nan),
                 }
 
                 for rr in RRS:
@@ -475,19 +472,19 @@ def run_backtest_generate_trades_4h(df_4h, cfg):
                 ladder_pending_touch_period = None
                 ladder_pending_touch_idx = None
 
-        # 2) setups clássicos
-        if any(s in SETUPS for s in ["PFR", "DL", "8.2", "8.3"]):
+        # 2) setups clássicos (filtrados por regime de MAs)
+        if classics_enabled:
             if i >= 2 and classic_allowed_regime(x, i, cfg):
                 pfr, dl, s82, s83 = check_signals_classic(x, i)
 
                 active = []
-                if pfr and "PFR" in SETUPS:
+                if pfr and "PFR" in setups:
                     active.append("PFR")
-                if dl and (not pfr) and "DL" in SETUPS:
+                if dl and (not pfr) and "DL" in setups:
                     active.append("DL")
-                if s82 and "8.2" in SETUPS:
+                if s82 and "8.2" in setups:
                     active.append("8.2")
-                if s83 and "8.3" in SETUPS:
+                if s83 and "8.3" in setups:
                     active.append("8.3")
 
                 for setup in active:
@@ -540,9 +537,9 @@ def run_backtest_generate_trades_4h(df_4h, cfg):
                         "ladder_touch_ma": np.nan,
                         "ladder_stop_ma": np.nan,
 
-                        "use_time_exit": cfg["use_time_exit"],
-                        "use_breakeven": cfg["use_breakeven"],
-                        "req_close_gt10": cfg["req_close_gt10"],
+                        "use_time_exit": cfg.get("use_time_exit", False),
+                        "use_breakeven": cfg.get("use_breakeven", False),
+                        "req_close_gt10": cfg.get("req_close_gt10", np.nan),
                     }
 
                     for rr in RRS:
@@ -624,22 +621,28 @@ def run_backtest_generate_trades_4h(df_4h, cfg):
 # =============================
 # CONFIGS (variáveis estruturais)
 # =============================
-def build_structural_configs():
-    """
-    2 x 2 x 2 = 8 configs:
-      - timeexit on/off
-      - breakeven on/off
-      - close>sma10 para clássicos on/off (c10)
-    """
+def build_structural_configs(include_c10: bool):
     configs = []
-    for use_time_exit, use_breakeven, req_close_gt10 in product([False, True], [False, True], [False, True]):
-        name = f"tx{int(use_time_exit)}_be{int(use_breakeven)}_c10{int(req_close_gt10)}"
-        configs.append({
-            "name": name,
-            "use_time_exit": use_time_exit,
-            "use_breakeven": use_breakeven,
-            "req_close_gt10": req_close_gt10,
-        })
+    if include_c10:
+        # 2 x 2 x 2 = 8 configs
+        for use_time_exit, use_breakeven, req_close_gt10 in product([False, True], [False, True], [False, True]):
+            name = f"tx{int(use_time_exit)}_be{int(use_breakeven)}_c10{int(req_close_gt10)}"
+            configs.append({
+                "name": name,
+                "use_time_exit": use_time_exit,
+                "use_breakeven": use_breakeven,
+                "req_close_gt10": req_close_gt10,
+            })
+    else:
+        # 2 x 2 = 4 configs (c10 não faz diferença sem clássicos)
+        for use_time_exit, use_breakeven in product([False, True], [False, True]):
+            name = f"tx{int(use_time_exit)}_be{int(use_breakeven)}"
+            configs.append({
+                "name": name,
+                "use_time_exit": use_time_exit,
+                "use_breakeven": use_breakeven,
+            })
+
     if len(configs) > MAX_CONFIGS:
         configs = configs[:MAX_CONFIGS]
     return configs
@@ -669,57 +672,44 @@ def metrics_overall(trades_df, rr):
 
 
 # =============================
-# MAIN
+# SCENARIO RUNNER
 # =============================
-def main():
+def run_scenario(x, scenario_name: str, setups: list, rank_setup: str):
     os.makedirs("results", exist_ok=True)
 
-    df_4h = fetch_history_4h(SYMBOL)
-    if df_4h.empty:
-        print("Erro: Sem dados 4h baixados.")
-        pd.DataFrame({"status": ["no_4h_data"]}).to_csv(f"results/only4h_{SYMBOL}.csv", index=False)
-        return
-
-    if SAVE_OHLCV:
-        df_4h.to_csv(f"results/ohlcv_{SYMBOL}_4h.csv", index=False)
-
-    configs = build_structural_configs()
-    print(f"ONLY 4H | configs={len(configs)}")
-    print(f"SETUPS={SETUPS} | RANK_SETUP={RANK_SETUP} | RANK_RR={RANK_RR}")
-    print("Obs: configs incluem _c10{0|1} para testar close>sma10 nos setups clássicos.")
+    classics_in_scenario = any(s in setups for s in ["PFR", "DL", "8.2", "8.3"])
+    configs = build_structural_configs(include_c10=classics_in_scenario)
 
     all_trades = []
     for cfg in configs:
-        print(f"Gerando trades 4h: {cfg['name']} ...")
-        try:
-            t = run_backtest_generate_trades_4h(df_4h=df_4h, cfg=cfg)
-            if not t.empty:
-                all_trades.append(t)
-        except Exception as e:
-            print(f"Erro em {cfg['name']}: {e}")
+        t = run_backtest_generate_trades_4h(x=x, cfg=cfg, setups=setups)
+        if not t.empty:
+            # tag do cenário para facilitar debug no CSV
+            t.insert(0, "scenario", scenario_name)
+            all_trades.append(t)
 
     if not all_trades:
-        print("0 trades gerados.")
-        pd.DataFrame({"status": ["no_trades"]}).to_csv(f"results/only4h_{SYMBOL}.csv", index=False)
-        return
+        return pd.DataFrame(), pd.DataFrame()
 
     trades = pd.concat(all_trades, ignore_index=True)
-    trades.to_csv(f"results/only4h_trades_raw_{SYMBOL}.csv", index=False)
 
+    # split
     train, test, cutoff = split_train_test(trades)
-    print(f"Cutoff treino/teste: {cutoff}")
 
-    train_rank = filter_for_rank(train)
-    test_rank = filter_for_rank(test)
+    train_rank = filter_for_rank(train, rank_setup)
+    test_rank = filter_for_rank(test, rank_setup)
 
-    stage1_rows = []
+    # stage1
+    rows = []
     for cfg_name, _ in trades.groupby("config"):
         tr = train_rank[train_rank["config"] == cfg_name]
         te = test_rank[test_rank["config"] == cfg_name]
         m_tr = metrics_overall(tr, RANK_RR)
         m_te = metrics_overall(te, RANK_RR)
 
-        stage1_rows.append({
+        rows.append({
+            "Scenario": scenario_name,
+            "RankSetup": rank_setup,
             "Config": cfg_name,
             "Train Trades": m_tr["Trades"],
             "Train WR": m_tr["WR"],
@@ -730,28 +720,78 @@ def main():
             "Eligible": (m_te["Trades"] >= MIN_TRADES_FOR_RANK_TEST),
         })
 
-    stage1 = pd.DataFrame(stage1_rows).sort_values(
+    stage1 = pd.DataFrame(rows).sort_values(
         ["Eligible", "Test AvgR", "Test Trades"],
         ascending=[False, False, False]
     )
 
-    stage1.to_csv(f"results/only4h_stage1_structural_{SYMBOL}.csv", index=False)
+    # save
+    trades.to_csv(f"results/scenario_trades_{SYMBOL}_{scenario_name}.csv", index=False)
+    stage1.to_csv(f"results/scenario_stage1_{SYMBOL}_{scenario_name}.csv", index=False)
 
-    print("\n=== Stage 1 (4h only) - ranking por Test AvgR @ RR="
-          f"{RANK_RR} | RankSetup={RANK_SETUP} (min test trades={MIN_TRADES_FOR_RANK_TEST}) ===")
-    print(tabulate(stage1, headers="keys", tablefmt="grid", showindex=False))
+    # print table for copy/paste
+    print("\n" + "=" * 80)
+    print(f"SCENARIO: {scenario_name} | SETUPS={setups} | RANK_SETUP={rank_setup} | RANK_RR={RANK_RR}")
+    print(f"Cutoff train/test: {cutoff}")
+    print(tabulate(stage1.drop(columns=["Scenario", "RankSetup"]), headers="keys", tablefmt="grid", showindex=False))
 
-    with open(f"results/only4h_summary_{SYMBOL}.md", "w", encoding="utf-8") as f:
-        f.write(f"# Only 4H Summary - {SYMBOL}\n\n")
-        f.write("- Trades: somente 4h\n")
-        f.write(f"- SETUPS={SETUPS}\n")
-        f.write(f"- RANK_SETUP={RANK_SETUP} | RANK_RR={RANK_RR}\n")
-        f.write(f"- Train fraction: {TRAIN_FRACTION}\n")
-        f.write(f"- Time exit bars (4h): {TIME_EXIT_BARS}\n")
-        f.write(f"- Break-even fraction of target: {BE_TARGET_FRACTION}\n")
-        f.write("Note: configs have _c10{0|1} for close>sma10 gating on classic setups.\n\n")
-        f.write("## Stage 1 (Structural)\n\n")
-        f.write(tabulate(stage1, headers="keys", tablefmt="pipe", showindex=False))
+    return trades, stage1
+
+
+# =============================
+# MAIN
+# =============================
+def main():
+    os.makedirs("results", exist_ok=True)
+
+    df_4h = fetch_history_4h(SYMBOL)
+    if df_4h.empty:
+        print("Erro: Sem dados 4h baixados.")
+        pd.DataFrame({"status": ["no_4h_data"]}).to_csv(f"results/no_data_{SYMBOL}.csv", index=False)
+        return
+
+    if SAVE_OHLCV:
+        df_4h.to_csv(f"results/ohlcv_{SYMBOL}_4h.csv", index=False)
+
+    x = add_indicators(df_4h).sort_values("ts").reset_index(drop=True)
+
+    # Cenários solicitados
+    scenarios = [
+        # 1) Só MA_LADDER
+        ("LADDER_ONLY", ["MA_LADDER"], "MA_LADDER"),
+
+        # 2) Só clássicos (ALL)
+        ("CLASSICS_ALL", ["PFR", "DL", "8.2", "8.3"], "ALL"),
+
+        # 3) Clássicos por setup (4 tabelas)
+        ("CLASSICS_PFR", ["PFR", "DL", "8.2", "8.3"], "PFR"),
+        ("CLASSICS_DL", ["PFR", "DL", "8.2", "8.3"], "DL"),
+        ("CLASSICS_8_2", ["PFR", "DL", "8.2", "8.3"], "8.2"),
+        ("CLASSICS_8_3", ["PFR", "DL", "8.2", "8.3"], "8.3"),
+    ]
+
+    # roda todos e salva um "master" também
+    master_stage1 = []
+    for name, setups, rank_setup in scenarios:
+        _, s1 = run_scenario(x=x, scenario_name=name, setups=setups, rank_setup=rank_setup)
+        if not s1.empty:
+            master_stage1.append(s1)
+
+    if master_stage1:
+        master = pd.concat(master_stage1, ignore_index=True)
+        master.to_csv(f"results/scenario_stage1_{SYMBOL}_MASTER.csv", index=False)
+
+        with open(f"results/scenario_summary_{SYMBOL}.md", "w", encoding="utf-8") as f:
+            f.write(f"# Scenario Summary - {SYMBOL}\n\n")
+            f.write(f"- RR rank: {RANK_RR}\n")
+            f.write(f"- Train fraction: {TRAIN_FRACTION}\n")
+            f.write(f"- Time exit bars (4h): {TIME_EXIT_BARS}\n")
+            f.write(f"- Break-even fraction of target: {BE_TARGET_FRACTION}\n\n")
+            f.write("Generated CSVs:\n")
+            f.write(f"- results/scenario_stage1_{SYMBOL}_*.csv\n")
+            f.write(f"- results/scenario_trades_{SYMBOL}_*.csv\n")
+    else:
+        print("Nenhum cenário gerou trades.")
 
 
 if __name__ == "__main__":
