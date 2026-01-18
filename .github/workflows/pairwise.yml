@@ -1,0 +1,31 @@
+name: analyze-pairwise
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pandas numpy requests tabulate
+      
+      # Garante que o script e os dados existam
+      # (Assumindo que os dados já estão no repo ou foram gerados antes)
+      - name: Run Analysis
+        run: python analyze_pairwise.py
+        
+      - name: Commit Results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase || true
+          git add results/pairwise_analysis_*.csv || true
+          git commit -m "Pairwise Analysis Results" || echo "no changes"
+          git push
